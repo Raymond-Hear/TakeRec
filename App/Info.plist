@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key><string>zh_CN</string>
+    <key>CFBundleDisplayName</key><string>简录</string>
+    <key>CFBundleExecutable</key><string>TakeRec</string>
+    <key>CFBundleIconFile</key><string>TakeRec.icns</string>
+    <key>CFBundleIconName</key><string>TakeRec</string>
+    <key>CFBundleIdentifier</key><string>local.takerec.community</string>
+    <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+    <key>CFBundleName</key><string>简录</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleShortVersionString</key><string>0.15.0</string>
+    <key>CFBundleVersion</key><string>15</string>
+    <key>LSApplicationCategoryType</key><string>public.app-category.video</string>
+    <key>LSMinimumSystemVersion</key><string>15.0</string>
+    <key>NSHighResolutionCapable</key><true/>
+    <key>NSCameraUsageDescription</key><string>开启摄像头后，预览并独立录制所选摄像头。</string>
+    <key>NSMicrophoneUsageDescription</key><string>开启麦克风后，测试所选输入的音量，并将解说录入本地视频。</string>
+    <key>NSLocalNetworkUsageDescription</key><string>用于接收你扫码连接的手机摄像头和麦克风。</string>
+    <key>NSSupportsContinuityCameraDeviceType</key><true/>
+    <key>UTExportedTypeDeclarations</key>
+    <array>
+        <dict>
+            <key>UTTypeIdentifier</key><string>local.takerec.desktake-project</string>
+            <key>UTTypeDescription</key><string>简录工程</string>
+            <key>UTTypeConformsTo</key><array><string>com.apple.package</string></array>
+            <key>UTTypeTagSpecification</key>
+            <dict><key>public.filename-extension</key><array><string>desktake</string></array></dict>
+        </dict>
+    </array>
+    <key>NSPrincipalClass</key><string>NSApplication</string>
+</dict>
+</plist>
