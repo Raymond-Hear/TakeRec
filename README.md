@@ -1,45 +1,49 @@
 # 简录 TakeRec
 
-简录是一款原生 macOS 录屏与轻剪辑工具。它分别保存屏幕、摄像头、麦克风和系统声音，方便录完以后调整人像位置、运镜和混音。当前公开测试版为 **0.15.0**，界面为简体中文。
+有时候我想录一段很短的演示，像坐在对方旁边那样，指着画面说「这里点一下，接下来这样做」。
 
-## 下载和试录
+录屏软件已经很多了。我用起来，还是常在几个小地方卡住。回看时，窗口里本来读得清的字变糊了。网页里的声音一响，我刚说的那句就听不清了。偏偏被盖过去的，可能就是「为什么要点这里」。
 
-从 GitHub 的 **Releases** 打开 `v0.15.0`，下载 `TakeRec-0.15.0-macOS-universal.zip`。解压后打开「简录.app」，也可将它拖到「应用程序」。支持 macOS 15 及以上，安装包包含 Apple 芯片和 Intel 架构。全屏录制时排除简录浮窗需要 macOS 15.2 或以上。
+后来我想，干脆做一个自己用着顺手的。第一版能录下来，也能导出去。再一段段试，才知道还差什么。慢慢地，屏幕、摄像头、麦克风和电脑声音各自留了一份。录完还能把解说单独拉响，把鼠标点到的地方放大。讲漏了一步，就接着录进去。
 
-测试包采用临时签名，尚未经过 Apple 公证。若 macOS 拦截首次打开，请确认文件来自本仓库 Release，再到「系统设置 → 隐私与安全性」查看是否有「仍要打开」。也可以用下面的步骤从源码构建。 [Apple 关于在 macOS 上安全打开 App 的说明](https://support.apple.com/zh-cn/102445)
+我把简录开源了，想看看换一种录法，它还会在哪里卡住。你可以拿它录教程、演示一个刚做好的功能，也可以只录十几秒，给朋友看一下刚才那个按钮在哪儿。
 
-1. 选择单窗口或全屏，在 macOS 选择器中指定要录的内容。
-2. 按需开启相机、麦克风和系统声音。相机支持预览和镜像，麦克风可以选设备、看电平。录制外放音频时，耳机或耳麦有助于减少串音。
-3. 按 `⌃⇧R` 开始，按 `⌃⇧S` 结束。录制浮条提供计时、音量、暂停和结束。可在「设置 → 快捷键」修改按键。
-4. 在时间线拖动、裁切或分割片段，调节各轨显隐、音量与运镜。按空格预览，`⌘K` 分割当前轨，`⌘S` 保存工程。需要续录时可把新素材接到当前工程末尾。
+## 先录一小段
 
-分辨率支持 1080p 和 4K 档位，保留来源比例，并以原始素材像素为上限。成片导出为 MP4。工程保存为 `.desktake`，其中含可继续编辑的分轨素材。提词器可在录制前填写和拖动，录制期间用快捷键翻页。
+下载公开测试版 **0.15.0**，解压后打开「简录.app」。支持 macOS 15 及以上，安装包同时适用于 Apple 芯片和 Intel Mac。[下载简录](https://github.com/Raymond-Hear/TakeRec/releases/download/v0.15.0/TakeRec-0.15.0-macOS-universal.zip)
 
-## 从源码构建
+可以先选一个窗口，按 `⌃⇧R` 开始，讲两句，再按 `⌃⇧S` 结束。如果想试试录完再调声音，开录前同时开启麦克风和系统声音，录完到「声音」里把原声调低一点。满意了就导出 MP4，想留着下次接着改，就保存为 `.desktake` 工程。
 
-需要 Mac 和完整的 Xcode。已使用 Xcode 26.6 构建。首次使用 Xcode 时，先打开一次并完成组件安装。若 `xcode-select -p` 显示命令行工具目录，在「Xcode → Settings → Locations → Command Line Tools」选择已安装的 Xcode。
+测试包使用临时签名，尚未经过 Apple 公证。首次打开若被拦截，请核对下载来源，再到「系统设置 → 隐私与安全性」查看「仍要打开」。[Apple 打开 App 的说明](https://support.apple.com/zh-cn/102445)
 
-在本仓库根目录运行：
+## 录完，欢迎回来聊两句
+
+如果简录刚好帮上了忙，欢迎在仓库右上角点个 **Star**。用过之后，哪一步省了事，哪一步又让你重录了一次，都欢迎回来告诉我。遇到问题时，写下简录和 macOS 的版本，再说说是怎么碰到的。用一个空白窗口复现就够了。[提交 Issues](https://github.com/Raymond-Hear/TakeRec/issues)
+
+<details>
+<summary>想从源码构建或调试</summary>
+
+需要安装完整的 Xcode。本版用 Xcode 26.6 验证过。首次使用 Xcode 时，先打开一次并完成组件安装。如果 `xcode-select -p` 指向单独的命令行工具目录，可在「Xcode → Settings → Locations → Command Line Tools」选择 Xcode。
+
+在终端下载源码、构建并打开简录。
 
 ```bash
+git clone https://github.com/Raymond-Hear/TakeRec.git
+cd TakeRec
 ./build.sh 'build/简录.app'
 open 'build/简录.app'
 ```
 
-脚本编译 Swift 源码、打包图标和网页接收器，并生成通用 App。默认使用本地临时签名。指定自有签名身份时可通过 `DESKTAKE_SIGN_IDENTITY` 传入。开发和本地构建不需要付费的 Apple Developer Program 会员资格。
+脚本默认使用本地临时签名。也可通过 `DESKTAKE_SIGN_IDENTITY` 指定自己的签名身份。
 
-## 调试
-
-先用一个空白窗口做短录制。逐项开启摄像头、麦克风与系统声音，查看录制前预览、浮条电平、各条音轨波形和导出的 MP4。若某项没有输入，先确认选中了正确设备，并到「系统设置 → 隐私与安全性」检查相应的屏幕与系统音频录制、摄像头或麦克风权限。更换签名或 App 版本后，macOS 可能会再次请求授权。
-
-需要断点时，构建当前 Mac 架构的调试版并在终端启动 LLDB：
+需要下断点时，构建当前 Mac 架构的调试版。
 
 ```bash
 TAKEREC_BUILD_CONFIGURATION=debug ./build.sh 'build/简录-调试.app'
 xcrun lldb 'build/简录-调试.app/Contents/MacOS/TakeRec'
 ```
 
-在 LLDB 中载入符号，再设断点：
+在 LLDB 中载入符号，让程序在主窗口打开时停下来。
 
 ```text
 target symbols add "build/简录-调试.app/Contents/Resources/TakeRec.dSYM"
@@ -47,23 +51,14 @@ breakpoint set --file DeskTakeApp.swift --line 44
 run
 ```
 
-用 macOS「控制台」按进程 `TakeRec` 查看日志和崩溃报告。报告问题时请注明简录版本、macOS 版本、Mac 架构、选择的录制来源和复现步骤，并用测试窗口代替个人录屏或工程。
+排查采集时，建议用空白窗口短录，逐项开启相机、麦克风和系统声音。没有输入时，先看选中的设备，再检查 macOS「隐私与安全性」里的授权。全屏录制时排除简录浮窗需要 macOS 15.2 或以上。在「控制台」里按进程名 `TakeRec` 可以查日志和崩溃报告。
 
-| 要调试的部分 | 入口 |
-| --- | --- |
-| 屏幕来源、采集配置 | [ScreenTake.swift](Sources/ScreenTake.swift) |
-| 相机、麦克风预览 | [DevicePreview.swift](Sources/DevicePreview.swift) |
-| 分轨写入 | [MovieWriter.swift](Sources/MovieWriter.swift) |
-| 光标与点击事件 | [PointerCapture.swift](Sources/PointerCapture.swift) |
-| 时间线与工程 | [ClipTimelineView.swift](Sources/ClipTimelineView.swift)、[TakeProject.swift](Sources/TakeProject.swift) |
-| 运镜、混音与导出 | [TakeCompositor.swift](Sources/TakeCompositor.swift)、[MovieExport.swift](Sources/MovieExport.swift) |
+</details>
 
-## 媒体与隐私
+## 素材和许可
 
-- 使用 Mac 本机输入时，屏幕、摄像头、麦克风、系统声音和点击轨迹在本机处理。工程和导出文件保存在 Mac。
-- 手机扫码是可选功能。启用时手机浏览器访问第三方 VDO.Ninja 页面，配对依赖其信令服务。相机和麦克风通过加密 WebRTC 传到 Mac，无法直连时可能经过 TURN 中继。服务可能处理 IP 和连接诊断。 [VDO.Ninja 工作原理](https://docs.vdo.ninja/readme/how-does-it-work) · [VDO.Ninja 隐私说明](https://docs.vdo.ninja/help/privacy-and-security-details/vdo.ninja-privacy-policy)
-- 「Agent 剪辑」把工程副本与说明写到用户选择的本机文件夹，并把提示词复制到剪贴板。由用户决定是否把素材交给外部工具，后续处理取决于所选工具。
+用 Mac 本机输入录制时，素材在本机处理和保存。手机扫码是可选功能，通过 VDO.Ninja 配对，再通过加密 WebRTC 把手机画面和声音传给 Mac。无法直连时可能经过 TURN 中继，服务也可能处理 IP 与连接诊断。[VDO.Ninja 隐私说明](https://docs.vdo.ninja/help/privacy-and-security-details/vdo.ninja-privacy-policy)
 
-## 许可
+「Agent 剪辑」会把素材包写到你选的本机文件夹，并把提示词复制到剪贴板。是否交给其他工具，由你决定。
 
-简录代码采用 [MIT](LICENSE)。Lucide 图标按随附的 [ISC 与 MIT 许可](App/Lucide-LICENSE.txt) 分发。网页接收器包含 VDO.Ninja SDK 1.6.2，SDK 源码随包分发并适用 [MPL-2.0](App/PhoneReceiver/VDO-Ninja-MPL-2.0.txt)。 [VDO.Ninja SDK 对应版本](https://github.com/steveseguin/ninjasdk/tree/328965a06fa19cf47c3f01182e9cb1d91f39214e)
+简录代码采用 MIT。Lucide 图标按随附的 ISC 与 MIT 许可分发，VDO.Ninja SDK 1.6.2 按 MPL-2.0 分发。[简录许可](LICENSE) · [Lucide 许可](App/Lucide-LICENSE.txt) · [VDO.Ninja SDK 许可](App/PhoneReceiver/VDO-Ninja-MPL-2.0.txt) · [SDK 对应源码](https://github.com/steveseguin/ninjasdk/tree/328965a06fa19cf47c3f01182e9cb1d91f39214e)
