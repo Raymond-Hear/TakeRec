@@ -80,3 +80,16 @@ Agent 素材包和临时转写文件导出到你选择的本机位置。使用�
 简录代码采用 MIT。Lucide 图标按随附的 ISC 与 MIT 许可分发，VDO.Ninja SDK 1.6.2 按 MPL-2.0 分发。[简录许可](LICENSE) · [Lucide 许可](App/Lucide-LICENSE.txt) · [VDO.Ninja SDK 许可](App/PhoneReceiver/VDO-Ninja-MPL-2.0.txt) · [SDK 对应源码](https://github.com/steveseguin/ninjasdk/tree/328965a06fa19cf47c3f01182e9cb1d91f39214e)
 
 </details>
+
+## 关于作者
+
+我是 **聆风Raymond**，简录的作者。
+
+- **公众号**　聆风Raymond
+- **邮箱**　[heylingfeng@111.com](mailto:heylingfeng@111.com)
+- **GitHub**　[@Raymond-Hear](https://github.com/Raymond-Hear)
+
+<p>
+  <img src="App/Assets.xcassets/WeChatFollowQRCode.imageset/follow.png" alt="聆风Raymond 公众号关注二维码" width="144"><br>
+  <sub>微信扫码关注</sub>
+</p>

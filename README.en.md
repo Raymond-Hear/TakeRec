@@ -80,3 +80,16 @@ Agent bundles and transcription files are saved to a folder you choose. When usi
 TakeRec’s code is MIT licensed. Lucide icons use the included ISC and MIT terms. The bundled VDO.Ninja SDK 1.6.2 uses MPL-2.0. [TakeRec license](LICENSE) · [Lucide licenses](App/Lucide-LICENSE.txt) · [VDO.Ninja SDK license](App/PhoneReceiver/VDO-Ninja-MPL-2.0.txt) · [SDK source](https://github.com/steveseguin/ninjasdk/tree/328965a06fa19cf47c3f01182e9cb1d91f39214e)
 
 </details>
+
+## About the author
+
+I’m **聆风Raymond**, the creator of TakeRec.
+
+- **WeChat Official Account**　聆风Raymond
+- **Email**　[heylingfeng@111.com](mailto:heylingfeng@111.com)
+- **GitHub**　[@Raymond-Hear](https://github.com/Raymond-Hear)
+
+<p>
+  <img src="App/Assets.xcassets/WeChatFollowQRCode.imageset/follow.png" alt="QR code for Raymond’s WeChat Official Account" width="144"><br>
+  <sub>Scan with WeChat to follow</sub>
+</p>
