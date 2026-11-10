@@ -7,37 +7,51 @@ struct VideoSpan: Sendable {
     let transform: CGAffineTransform
     var motion: MotionEffects?
     var drawsCursor = false
+    var keyboard: KeyboardTrace?
+}
+
+struct CameraVideoLane: Sendable {
+    let id: CMPersistentTrackID
+    let spans: [VideoSpan]
+    let mirrored: Bool
 }
 
 final class TakeInstruction: NSObject, AVVideoCompositionInstructionProtocol, @unchecked Sendable {
     let timeRange: CMTimeRange
     let screenID: CMPersistentTrackID?
-    let cameraID: CMPersistentTrackID?
     let screens: [VideoSpan]
-    let cameras: [VideoSpan]
+    let cameras: [CameraVideoLane]
     let settings: EffectSettings
+    let presentation: PresentationSettings
+    let sourceAspect: CGFloat
+    let background: CIImage?
+    let captions: SubtitleArtwork
     let passthroughTrackID = kCMPersistentTrackID_Invalid
     let enablePostProcessing = true
     let containsTweening = true
 
     var requiredSourceTrackIDs: [NSValue]? {
-        let visible = [screens.isEmpty ? nil : screenID, cameras.isEmpty ? nil : cameraID].compactMap { $0 }
-        let required = visible.isEmpty ? [screenID ?? cameraID].compactMap { $0 } : visible
+        let visible = [screens.isEmpty ? nil : screenID].compactMap { $0 } + cameras.filter { !$0.spans.isEmpty }.map(\.id)
+        let required = visible.isEmpty ? [screenID ?? cameras.first?.id].compactMap { $0 } : visible
         return required.map { NSNumber(value: $0) }
     }
 
-    init(timeRange: CMTimeRange, screenID: CMPersistentTrackID?, cameraID: CMPersistentTrackID?,
-         screens: [VideoSpan], cameras: [VideoSpan], settings: EffectSettings) {
+    init(timeRange: CMTimeRange, screenID: CMPersistentTrackID?,
+         screens: [VideoSpan], cameras: [CameraVideoLane], settings: EffectSettings,
+         presentation: PresentationSettings, sourceAspect: CGFloat, background: CIImage?, captions: SubtitleArtwork) {
         self.timeRange = timeRange
         self.screenID = screenID
-        self.cameraID = cameraID
         self.screens = screens
         self.cameras = cameras
         self.settings = settings
+        self.presentation = presentation
+        self.sourceAspect = sourceAspect
+        self.background = background
+        self.captions = captions
     }
 
     func screen(at time: Double) -> VideoSpan? { span(in: screens, at: time) }
-    func camera(at time: Double) -> VideoSpan? { span(in: cameras, at: time) }
+    func camera(in lane: CameraVideoLane, at time: Double) -> VideoSpan? { span(in: lane.spans, at: time) }
 
     private func span(in spans: [VideoSpan], at time: Double) -> VideoSpan? {
         var left = 0
@@ -55,6 +69,7 @@ final class TakeInstruction: NSObject, AVVideoCompositionInstructionProtocol, @u
 final class TakeCompositor: NSObject, AVVideoCompositing, @unchecked Sendable {
     private let context = CIContext(options: [.cacheIntermediates: false])
     private let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
+    private let keyboardArtwork = KeyboardArtwork()
 
     var sourcePixelBufferAttributes: [String: any Sendable]? {
         [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
@@ -76,14 +91,49 @@ final class TakeCompositor: NSObject, AVVideoCompositing, @unchecked Sendable {
         let canvas = CGRect(origin: .zero, size: request.renderContext.size)
         let time = request.compositionTime.seconds
         let screen = instruction.screen(at: time)
-        let effect = screen?.motion?.frame(at: time) ?? MotionEffects.Frame()
         let settings = instruction.settings
-        let pan = effect.pan(in: canvas)
-        var result = CIImage(color: .black).cropped(to: canvas)
+        let layout = instruction.presentation
+        let portrait = layout.framing == .portrait ? layout.portrait : nil
+        let black = CIImage(color: .black).cropped(to: canvas)
+        var result = portrait?.background.render(in: canvas, imported: instruction.background).composited(over: black) ?? black
         if let screen, let id = instruction.screenID, let source = request.sourceFrame(byTrackID: id) {
-            result = fit(oriented(source, transform: screen.transform), in: canvas, fill: false)
-                .composited(over: result).transformed(by: pan).cropped(to: canvas)
+            let box = layout.screenBounds(in: canvas, sourceAspect: instruction.sourceAspect)
+            let local = CGRect(origin: .zero, size: box.size)
+            let layer = screenLayer(oriented(source, transform: screen.transform), span: screen, time: time,
+                                    canvas: local, settings: settings)
+            result = layer.transformed(by: CGAffineTransform(translationX: box.minX, y: box.minY)).composited(over: result)
         }
+        let cameraImages = instruction.cameras.compactMap { lane -> (CIImage, Bool)? in
+            guard let span = instruction.camera(in: lane, at: time), let buffer = request.sourceFrame(byTrackID: lane.id) else { return nil }
+            return (oriented(buffer, transform: span.transform), lane.mirrored)
+        }
+        let boxes = layout.cameraBoxes(in: canvas, count: cameraImages.count, settings: settings)
+        for ((image, mirrored), box) in zip(cameraImages, boxes) {
+            result = cameraOverlay(image, on: result, box: box, mirrored: mirrored,
+                                   shape: portrait?.cameraShape ?? settings.cameraShape, lighting: settings.portraitLighting)
+        }
+        if portrait?.showsProgress == true {
+            result = progress(at: time, duration: instruction.timeRange.duration.seconds, in: canvas).composited(over: result)
+        }
+        if settings.showKeyboard != false, let clip = screen?.clip, let keys = screen?.keyboard,
+           let overlay = keyboardArtwork.overlay(
+               labels: keys.recentLabels(at: clip.sourceStart + time - clip.at, since: clip.sourceStart),
+               corner: settings.keyboardCorner ?? keys.corner, canvas: canvas) {
+            result = overlay.composited(over: result)
+        }
+        if let overlay = instruction.captions.overlay(at: time, in: canvas, portrait: portrait != nil) {
+            result = overlay.composited(over: result)
+        }
+        context.render(result.cropped(to: canvas), to: output, bounds: canvas, colorSpace: colorSpace)
+        request.finish(withComposedVideoFrame: output)
+    }
+
+    private func screenLayer(_ image: CIImage, span: VideoSpan, time: Double,
+                             canvas: CGRect, settings: EffectSettings) -> CIImage {
+        let effect = span.motion?.frame(at: time) ?? MotionEffects.Frame()
+        let pan = effect.pan(in: canvas)
+        let black = CIImage(color: .black).cropped(to: canvas)
+        var result = fit(image, in: canvas, fill: false).composited(over: black).transformed(by: pan).cropped(to: canvas)
         if effect.blur > 0.1 {
             result = result.clampedToExtent().applyingFilter("CIGaussianBlur", parameters: [
                 kCIInputRadiusKey: effect.blur
@@ -99,7 +149,7 @@ final class TakeCompositor: NSObject, AVVideoCompositing, @unchecked Sendable {
             result = sprite(ring, at: point, hotspot: CGPoint(x: 32, y: 32), side: side)
                 .composited(over: result)
         }
-        if screen?.drawsCursor == true, settings.cursor != .hidden {
+        if span.drawsCursor, settings.cursor != .hidden {
             for (index, point) in effect.trail.enumerated() {
                 let position = CGPoint(x: point.x * canvas.width, y: (1 - point.y) * canvas.height).applying(pan)
                 let dot = Self.dot.applyingFilter("CIColorMatrix", parameters: [
@@ -109,18 +159,23 @@ final class TakeCompositor: NSObject, AVVideoCompositing, @unchecked Sendable {
                     .composited(over: result)
             }
         }
-        if screen?.drawsCursor == true, let point = effect.cursor, let glyph = Self.glyph(settings.cursor) {
+        if span.drawsCursor, let point = effect.cursor, let glyph = Self.glyph(settings.cursor) {
             let hotspot = CGPoint(x: point.x * canvas.width, y: (1 - point.y) * canvas.height).applying(pan)
             result = sprite(glyph.0, at: hotspot, hotspot: glyph.1,
                             side: cursorUnit * clamp(settings.cursorSize, 0.5, 3)).composited(over: result)
         }
-        if let span = instruction.camera(at: time), let id = instruction.cameraID,
-           let camera = request.sourceFrame(byTrackID: id) {
-            result = cameraOverlay(oriented(camera, transform: span.transform), on: result,
-                                   canvas: canvas, settings: settings)
-        }
-        context.render(result.cropped(to: canvas), to: output, bounds: canvas, colorSpace: colorSpace)
-        request.finish(withComposedVideoFrame: output)
+        return result.cropped(to: canvas)
+    }
+
+    private func progress(at time: Double, duration: Double, in canvas: CGRect) -> CIImage {
+        let bar = CGRect(x: canvas.width * 0.16, y: canvas.height * 0.44,
+                         width: canvas.width * 0.68, height: max(2, canvas.width * 0.004))
+        let rail = rounded(bar, radius: bar.height / 2, color: CIColor(red: 0.12, green: 0.09, blue: 0.23, alpha: 0.26))
+        let width = bar.width * clamp(time / duration, 0, 1)
+        guard width > 0 else { return rail }
+        let fill = CGRect(origin: bar.origin, size: CGSize(width: width, height: bar.height))
+        return rounded(fill, radius: min(width, bar.height) / 2,
+                       color: CIColor(red: 0.81, green: 0.73, blue: 1)).composited(over: rail)
     }
 
     private func oriented(_ buffer: CVPixelBuffer, transform: CGAffineTransform) -> CIImage {
@@ -145,26 +200,25 @@ final class TakeCompositor: NSObject, AVVideoCompositing, @unchecked Sendable {
                                                         ty: position.y - hotspot.y * scale))
     }
 
-    private func cameraOverlay(_ camera: CIImage, on background: CIImage, canvas: CGRect, settings: EffectSettings) -> CIImage {
-        let side = min(canvas.width, canvas.height) * clamp(settings.cameraSize, 0.12, 0.55)
-        let margin = min(canvas.width, canvas.height) * 0.032
-        let right = settings.cameraCorner == .topRight || settings.cameraCorner == .bottomRight
-        let top = settings.cameraCorner == .topRight || settings.cameraCorner == .topLeft
-        let box = CGRect(x: right ? canvas.maxX - margin - side : margin,
-                         y: top ? canvas.maxY - margin - side : margin, width: side, height: side)
-        let shape = CIFilter.roundedRectangleGenerator()
-        shape.extent = box
-        shape.radius = Float(side * (settings.cameraShape == .circle ? 0.5 : 0.18))
-        shape.color = .white
-        let mask = shape.outputImage ?? CIImage(color: .white).cropped(to: box)
-        let adjusted = settings.portraitLighting?.apply(to: camera) ?? camera
+    private func cameraOverlay(_ camera: CIImage, on background: CIImage, box: CGRect,
+                               mirrored: Bool, shape: CameraShape, lighting: PortraitLighting?) -> CIImage {
+        let mask = rounded(box, radius: min(box.width, box.height) * (shape == .circle ? 0.5 : 0.18), color: .white)
+        let adjusted = lighting?.apply(to: camera) ?? camera
         let fitted = fit(adjusted, in: box, fill: true)
-        let subject = settings.cameraMirrored
+        let subject = mirrored
             ? fitted.transformed(by: CGAffineTransform(a: -1, b: 0, c: 0, d: 1, tx: box.midX * 2, ty: 0))
             : fitted
         return subject.applyingFilter("CIBlendWithAlphaMask", parameters: [
             kCIInputBackgroundImageKey: background, kCIInputMaskImageKey: mask
         ])
+    }
+
+    private func rounded(_ box: CGRect, radius: CGFloat, color: CIColor) -> CIImage {
+        let shape = CIFilter.roundedRectangleGenerator()
+        shape.extent = box
+        shape.radius = Float(radius)
+        shape.color = color
+        return shape.outputImage ?? CIImage(color: color).cropped(to: box)
     }
 
     static func glyph(_ style: CursorStyle) -> (CIImage, CGPoint)? {

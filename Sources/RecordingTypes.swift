@@ -1,6 +1,14 @@
 import AVFoundation
 import Foundation
 
+func isPhoneInput(_ id: String?) -> Bool {
+    #if TAKEREC_STORE
+    return false
+    #else
+    return id == PhoneLink.deviceID
+    #endif
+}
+
 enum CursorAppearance: String, CaseIterable, Identifiable, Codable, Sendable {
     case system = "真实系统光标"
     case editable = "可编辑样式"
@@ -34,6 +42,19 @@ struct CaptureOptions: Sendable {
     var cameraResolution = VideoResolution.hd
     var portraitLighting: PortraitLighting?
     var microphoneGain = 1.0
+    var keyboard: KeyboardCaptureOptions?
+    var additionalCameras: [TrackKind: String] = [:]
+    var cameraNames: [TrackKind: String] = [:]
+
+    var cameras: [TrackKind: String] {
+        var selected = additionalCameras.filter { $0.key.isCamera && $0.key != .camera }
+        selected[.camera] = cameraID
+        return selected
+    }
+
+    func resolution(for camera: TrackKind) -> VideoResolution {
+        camera == .camera ? cameraResolution : .hd
+    }
 }
 
 enum PreviewGeometry {
@@ -46,16 +67,28 @@ enum PreviewGeometry {
 }
 
 enum TrackKind: String, CaseIterable, Identifiable, Codable, Sendable {
-    case screen, camera, system, microphone, originalAudio
+    case screen, camera, camera2, camera3, system, microphone, originalAudio
 
+    static let cameraTracks: [Self] = [.camera, .camera2, .camera3]
     var id: Self { self }
-    var isVideo: Bool { self == .screen || self == .camera }
+    var isCamera: Bool { Self.cameraTracks.contains(self) }
+    var isVideo: Bool { self == .screen || isCamera }
+    var angleTitle: String {
+        switch self {
+        case .camera: "机位 1"
+        case .camera2: "机位 2"
+        case .camera3: "机位 3"
+        default: title
+        }
+    }
     var maximumVolume: Double { self == .microphone ? 2 : 1 }
     var isBackgroundAudio: Bool { self == .system || self == .originalAudio }
     var filename: String {
         switch self {
         case .screen, .originalAudio: "screen.mp4"
         case .camera: "camera.mp4"
+        case .camera2: "camera-2.mp4"
+        case .camera3: "camera-3.mp4"
         case .system: "system.m4a"
         case .microphone: "microphone.m4a"
         }
@@ -64,6 +97,8 @@ enum TrackKind: String, CaseIterable, Identifiable, Codable, Sendable {
         switch self {
         case .screen: "屏幕"
         case .camera: "人像"
+        case .camera2: "机位 2"
+        case .camera3: "机位 3"
         case .system: "系统声音"
         case .microphone: "麦克风"
         case .originalAudio: "原片声音"

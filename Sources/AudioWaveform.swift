@@ -5,6 +5,11 @@ struct AudioWaveform: Sendable {
     let interval: Double
     let peaks: [Float]
 
+    var hasAudibleInput: Bool {
+        let activeTime = Double(peaks.filter { $0 >= 0.0056 }.count) * interval
+        return activeTime > 0 && activeTime >= min(1, Double(peaks.count) * interval * 0.04)
+    }
+
     func peak(from start: Double, to end: Double) -> Float {
         guard !peaks.isEmpty else { return 0 }
         let first = max(0, Int(floor(start / interval)))

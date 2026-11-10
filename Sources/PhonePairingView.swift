@@ -1,9 +1,13 @@
+#if !TAKEREC_STORE
 import CoreImage.CIFilterBuiltins
 import SwiftUI
 
 struct PhonePairingView: View {
     @ObservedObject var link: PhoneLink
     let useInputs: () -> Void
+    let canAddCamera: () -> Bool
+    let addCamera: () -> Void
+    let cameraSelected: () -> Bool
     let renew: () -> Void
     let disconnect: () -> Void
     @Environment(\.dismiss) private var dismiss
@@ -52,12 +56,27 @@ struct PhonePairingView: View {
                 Spacer()
                 Button("关闭") { dismiss() }
                 if link.active {
-                    Button("使用手机输入") {
-                        useInputs()
-                        dismiss()
+                    if canAddCamera() {
+                        Button("改用手机输入") {
+                            useInputs()
+                            dismiss()
+                        }
+                        Button("添加为新机位") {
+                            addCamera()
+                            dismiss()
+                        }
+                        .buttonStyle(DeskPrimaryButton())
+                    } else if cameraSelected(), link.hasVideo {
+                        Button("保留当前机位") { dismiss() }
+                            .buttonStyle(DeskPrimaryButton())
+                    } else {
+                        Button("使用手机输入") {
+                            useInputs()
+                            dismiss()
+                        }
+                        .buttonStyle(DeskPrimaryButton())
+                        .disabled(!link.hasVideo && !link.hasAudio)
                     }
-                    .buttonStyle(DeskPrimaryButton())
-                    .disabled(!link.hasVideo && !link.hasAudio)
                 } else {
                     Button("生成二维码", action: renew)
                         .buttonStyle(DeskPrimaryButton())
@@ -82,3 +101,4 @@ struct PhonePairingView: View {
         return CIContext().createCGImage(output, from: output.extent)
     }
 }
+#endif

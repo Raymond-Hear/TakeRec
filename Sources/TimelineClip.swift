@@ -11,6 +11,7 @@ struct TimelineClip: Codable, Equatable, Identifiable, Sendable {
     var sourceStart: Double
     var length: Double
     var at: Double
+    var hidden: Bool?
 
     var end: Double { at + length }
     var sourceEnd: Double { sourceStart + length }

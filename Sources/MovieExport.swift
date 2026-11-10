@@ -1,4 +1,5 @@
 @preconcurrency import AVFoundation
+import CoreImage
 import Darwin
 import Foundation
 
@@ -31,6 +32,7 @@ struct MovieTimeline {
 enum MovieExport {
     static func timeline(for project: TakeProject, manifest: TakeManifest, cache: URL,
                          resolution: VideoResolution = .uhd,
+                         proxy: Bool = false, audioOnly: Bool = false,
                          microphoneWaveforms: [String: AudioWaveform]? = nil) async throws -> MovieTimeline {
         let composition = AVMutableComposition()
         let clips = manifest.timelineClips.sorted { $0.at < $1.at }
@@ -47,21 +49,21 @@ enum MovieExport {
         let baseSize = try await orientedSize(for: sourceCanvas)
         var canvasScale: CGFloat = 1
         var screenID: CMPersistentTrackID?
-        var cameraID: CMPersistentTrackID?
         var screens: [VideoSpan] = []
-        var cameras: [VideoSpan] = []
+        var cameras: [CameraVideoLane] = []
         var levels: [(kind: TrackKind?, track: AVCompositionTrack, gain: Double)] = []
 
         for kind in manifest.tracks {
             let edit = manifest.edit(kind)
             let lane = clips.filter { $0.kind == kind }
             // Keep video timing when every picture track is hidden, so audio-only preview still has a canvas.
-            guard !lane.isEmpty, kind.isVideo || (edit.enabled && edit.volume > 0) else { continue }
+            guard !lane.isEmpty, kind.isVideo ? !audioOnly : (edit.enabled && edit.volume > 0) else { continue }
             let type: AVMediaType = kind.isVideo ? .video : .audio
             guard let destination = composition.addMutableTrack(withMediaType: type, preferredTrackID: kCMPersistentTrackID_Invalid) else {
                 throw RecorderError.message("无法建立\(kind.title)轨。")
             }
             var sources: [String: AVAssetTrack] = [:]
+            var cameraSpans: [VideoSpan] = []
             for clip in lane {
                 try Task.checkCancellation()
                 let source: AVAssetTrack
@@ -87,43 +89,61 @@ enum MovieExport {
 
                 if kind == .screen && edit.enabled {
                     let transform = try await source.load(.preferredTransform)
+                    let recording = manifest.screenRecording(for: clip.file)
                     screens.append(VideoSpan(clip: clip, transform: transform,
                                              motion: motion(for: clip, manifest: manifest),
-                                             drawsCursor: manifest.screenRecording(for: clip.file)?.drawsEditableCursor == true))
-                } else if kind == .camera && edit.enabled {
-                    cameras.append(VideoSpan(clip: clip, transform: try await source.load(.preferredTransform)))
+                                             drawsCursor: recording?.drawsEditableCursor == true,
+                                             keyboard: recording?.keyboard))
+                } else if kind.isCamera && edit.enabled && clip.hidden != true {
+                    cameraSpans.append(VideoSpan(clip: clip, transform: try await source.load(.preferredTransform)))
                 }
             }
+            let end = destination.timeRange.end
+            if end < length {
+                destination.insertEmptyTimeRange(CMTimeRange(start: end, end: length))
+            }
             if kind.isVideo {
-                let end = destination.timeRange.end
-                if end < length {
-                    destination.insertEmptyTimeRange(CMTimeRange(start: end, end: length))
-                }
                 if kind == .screen { screenID = destination.trackID }
-                else { cameraID = destination.trackID }
+                else {
+                    cameras.append(CameraVideoLane(id: destination.trackID, spans: cameraSpans,
+                                                   mirrored: manifest.cameraMirrored(kind)))
+                }
             } else {
                 levels.append((kind, destination, edit.volume))
             }
         }
 
-        guard screenID != nil || cameraID != nil else {
+        guard audioOnly || screenID != nil || !cameras.isEmpty else {
             throw RecorderError.message("无法建立画面时间线。")
         }
         if manifest.effects.clickSound {
             let markers = manifest.timelineMarkers
-            if !markers.isEmpty,
+            if manifest.effects.clickVolume > 0, !markers.isEmpty,
                let sound = try await addClickAudio(markers, to: composition, cache: cache,
                                                     preset: manifest.effects.clickPreset, end: length.seconds) {
                 levels.append((nil, sound, clamp(manifest.effects.clickVolume, 0, 1)))
             }
         }
+        if audioOnly, !levels.isEmpty {
+            let audibleEnd = levels.flatMap { $0.track.segments }
+                .filter { !$0.isEmpty }.map { $0.timeMapping.target.end }.max() ?? .zero
+            if audibleEnd < length {
+                let silence = try await fillAudioTail(to: length, in: composition, cache: cache)
+                assets["AudioTail"] = silence
+            }
+        }
 
+        let presentation = manifest.canvasSettings
+        let background = try audioOnly ? nil : backgroundImage(for: project, settings: presentation)
         let instruction = TakeInstruction(timeRange: CMTimeRange(start: .zero, duration: length),
-                                          screenID: screenID, cameraID: cameraID, screens: screens, cameras: cameras,
-                                          settings: manifest.effects)
+                                          screenID: screenID, screens: screens, cameras: cameras,
+                                          settings: manifest.effects, presentation: presentation,
+                                          sourceAspect: baseSize.width / baseSize.height, background: background,
+                                          captions: SubtitleArtwork(cues: audioOnly ? [] : manifest.subtitleCues,
+                                                                    style: manifest.captionStyle))
         let video = AVMutableVideoComposition()
         video.customVideoCompositorClass = TakeCompositor.self
-        video.renderSize = try resolution.size(for: baseSize, scale: canvasScale).dimensions
+        video.renderSize = try presentation.renderSize(source: baseSize, scale: canvasScale, resolution: resolution, proxy: proxy)
         video.frameDuration = CMTime(value: 1, timescale: CaptureSize.framesPerSecond)
         video.instructions = [instruction]
 
@@ -190,18 +210,69 @@ enum MovieExport {
         return MotionEffects(settings: manifest.effects, pointer: trace)
     }
 
-    static func save(_ timeline: MovieTimeline, to destination: URL) async throws {
-        guard let exporter = AVAssetExportSession(asset: timeline.composition, presetName: AVAssetExportPresetHighestQuality) else {
-            throw RecorderError.message("无法启动 MP4 导出。")
-        }
-        exporter.videoComposition = timeline.video
-        exporter.audioMix = timeline.audio
-        exporter.shouldOptimizeForNetworkUse = true
+    static func backgroundImage(for project: TakeProject, settings: PresentationSettings) throws -> CIImage? {
+        guard settings.framing == .portrait, settings.portrait.background == .image,
+              let filename = settings.portrait.backgroundAsset else { return nil }
+        return CIImage(cgImage: try CanvasBackground.importedImage(at: project.source(filename)))
+    }
 
-        let staging = destination.deletingLastPathComponent()
-            .appendingPathComponent(".DeskTake-\(UUID().uuidString).mp4")
-        defer { try? FileManager.default.removeItem(at: staging) }
-        try await exporter.export(to: staging, as: .mp4)
+    // Audio-only export trims empty edits after its last sample. End with a short silent PCM segment
+    // so a transcript can use the same clock as the video, including a silent outro.
+    private static func fillAudioTail(to end: CMTime, in composition: AVMutableComposition,
+                                      cache: URL) async throws -> AVURLAsset {
+        let url = cache.appendingPathComponent("transcript-silence.caf")
+        if !FileManager.default.fileExists(atPath: url.path) {
+            try FileManager.default.createDirectory(at: cache, withIntermediateDirectories: true,
+                                                    attributes: [.posixPermissions: 0o700])
+            let staging = cache.appendingPathComponent(".silence-\(UUID()).caf")
+            defer { try? FileManager.default.removeItem(at: staging) }
+            let frames: AVAudioFrameCount = 5_760
+            guard let format = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 1),
+                  let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames),
+                  let channel = buffer.floatChannelData?[0] else {
+                throw RecorderError.message("无法填充转写音频的静音。")
+            }
+            buffer.frameLength = frames
+            channel.update(repeating: 0, count: Int(frames))
+            do {
+                let file = try AVAudioFile(forWriting: staging, settings: format.settings)
+                try file.write(from: buffer)
+            }
+            guard rename(staging.path, url.path) == 0 else {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+        }
+        let asset = AVURLAsset(url: url)
+        guard let source = try await asset.loadTracks(withMediaType: .audio).first,
+              let track = composition.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid) else {
+            throw RecorderError.message("无法保留完整的转写音频时长。")
+        }
+        let range = try await source.load(.timeRange)
+        let duration = min(end, range.duration)
+        try track.insertTimeRange(CMTimeRange(start: range.start, duration: duration), of: source, at: end - duration)
+        return asset
+    }
+
+    static func save(_ timeline: MovieTimeline, to destination: URL, audioOnly: Bool = false) async throws {
+        if audioOnly, timeline.audio == nil {
+            throw RecorderError.message("时间线上没有已启用的声音。请打开要转写的音轨，再试一次。")
+        }
+        let preset = audioOnly ? AVAssetExportPresetAppleM4A : AVAssetExportPresetHighestQuality
+        guard let exporter = AVAssetExportSession(asset: timeline.composition, presetName: preset) else {
+            throw RecorderError.message(audioOnly ? "无法启动音频导出。" : "无法启动 MP4 导出。")
+        }
+        if !audioOnly { exporter.videoComposition = timeline.video }
+        exporter.timeRange = CMTimeRange(start: .zero, duration: time(timeline.length))
+        exporter.audioMix = timeline.audio
+        exporter.shouldOptimizeForNetworkUse = !audioOnly
+
+        let suffix = audioOnly ? "m4a" : "mp4"
+        let files = FileManager.default
+        let stagingFolder = try files.url(for: .itemReplacementDirectory, in: .userDomainMask,
+                                          appropriateFor: destination, create: true)
+        defer { try? files.removeItem(at: stagingFolder) }
+        let staging = stagingFolder.appendingPathComponent("TakeRec.\(suffix)")
+        try await exporter.export(to: staging, as: audioOnly ? .m4a : .mp4)
         guard rename(staging.path, destination.path) == 0 else {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
@@ -221,6 +292,14 @@ enum MovieExport {
             try track.insertTimeRange(CMTimeRange(start: .zero, duration: time(span)),
                                       of: sound, at: time(marker.time))
             lastEnd = marker.time + span
+        }
+        guard lastEnd > 0 else {
+            composition.removeTrack(track)
+            return nil
+        }
+        let clipEnd = track.timeRange.end
+        if clipEnd < time(end) {
+            track.insertEmptyTimeRange(CMTimeRange(start: clipEnd, end: time(end)))
         }
         return track
     }

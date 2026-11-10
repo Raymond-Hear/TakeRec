@@ -64,7 +64,7 @@ enum SpeechDucking {
             input.setVolume(volume, at: .zero)
             return
         }
-        let lowered = volume * 0.25
+        let lowered = volume * 0.10
         var position = 0.0
         func ramp(from start: Double, to end: Double, _ initial: Float, _ final: Float) {
             let from = CMTime(seconds: start, preferredTimescale: 48_000)

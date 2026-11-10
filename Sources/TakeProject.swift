@@ -24,6 +24,7 @@ struct PointerTrace: Codable, Equatable, Sendable {
 struct ScreenRecording: Codable, Equatable, Sendable {
     var pointer: PointerTrace
     let cursorAppearance: CursorAppearance?
+    var keyboard: KeyboardTrace?
 
     var drawsEditableCursor: Bool {
         (cursorAppearance ?? (pointer.samples.isEmpty ? .system : .editable)) == .editable
@@ -87,6 +88,8 @@ struct EffectSettings: Codable, Equatable, Sendable {
     var personMirrored: Bool?
     var cameraMirrored: Bool { personMirrored ?? false }
     var portraitLighting: PortraitLighting?
+    var showKeyboard: Bool?
+    var keyboardCorner: CameraCorner?
 }
 
 struct TrackEdit: Codable, Equatable, Sendable {
@@ -112,20 +115,66 @@ struct TakeManifest: Codable, Equatable, Sendable {
     var duckSystemAudio: Bool?
     var baseTracks: [TrackKind]?
     var appendedScreens: [String: ScreenRecording]?
+    var keyboard: KeyboardTrace?
+    var presentation: PresentationSettings?
+    var subtitles: [SubtitleCue]?
+    var subtitleStyle: SubtitleStyle?
+    var cameraNames: [TrackKind: String]?
+    var cameraMirrors: [TrackKind: Bool]?
 
     var timelineClips: [TimelineClip] { clips ?? [] }
     var timelineDuration: Double { timelineClips.map(\.end).max() ?? 0 }
-    var assetFiles: Set<String> { Set((baseTracks ?? tracks).map(\.filename)).union(timelineClips.map(\.file)) }
+    var assetFiles: Set<String> {
+        var files = Set((baseTracks ?? tracks).map(\.filename)).union(timelineClips.map(\.file))
+        if let background = presentation?.portrait.backgroundAsset { files.insert(background) }
+        return files
+    }
+    var canvasSettings: PresentationSettings { presentation ?? PresentationSettings() }
+    var subtitleCues: [SubtitleCue] { subtitles ?? [] }
+    var captionStyle: SubtitleStyle { subtitleStyle ?? SubtitleStyle() }
+    var cameraTracks: [TrackKind] { tracks.filter(\.isCamera) }
+    func trackTitle(_ kind: TrackKind) -> String {
+        kind.isCamera && cameraTracks.count > 1 ? kind.angleTitle : kind.title
+    }
+    func trackDescription(_ kind: TrackKind) -> String {
+        if let name = cameraNames?[kind] { return "\(trackTitle(kind)) · \(name)" }
+        return trackTitle(kind)
+    }
+    func cameraMirrored(_ kind: TrackKind) -> Bool {
+        kind == .camera ? effects.cameraMirrored : cameraMirrors?[kind] == true
+    }
     var drawsEditableCursor: Bool {
         timelineClips.contains { $0.kind == .screen && screenRecording(for: $0.file)?.drawsEditableCursor == true }
     }
     var hasNarrationTracks: Bool { tracks.contains(.microphone) && tracks.contains(where: \.isBackgroundAudio) }
+    var hasKeyboardPresses: Bool {
+        timelineClips.contains { clip in
+            clip.kind == .screen && screenRecording(for: clip.file)?.keyboard?
+                .presses(in: clip.sourceStart..<clip.sourceEnd).isEmpty == false
+        }
+    }
+    var hasKeyboardTrack: Bool {
+        timelineClips.contains { $0.kind == .screen && screenRecording(for: $0.file)?.keyboard != nil }
+    }
 
     func screenRecording(for file: String) -> ScreenRecording? {
         if file == TrackKind.screen.filename, !flattened {
-            return ScreenRecording(pointer: pointer, cursorAppearance: cursorAppearance)
+            return ScreenRecording(pointer: pointer, cursorAppearance: cursorAppearance, keyboard: keyboard)
         }
         return appendedScreens?[file]
+    }
+
+    func keyboardPresses(in range: Range<Double>) -> [RecordedKeyPress] {
+        timelineClips.flatMap { clip -> [RecordedKeyPress] in
+            guard clip.kind == .screen, let keys = screenRecording(for: clip.file)?.keyboard else { return [] }
+            let lower = max(clip.at, range.lowerBound)
+            let upper = min(clip.end, range.upperBound)
+            guard lower < upper else { return [] }
+            let offset = clip.at - clip.sourceStart
+            return keys.presses(in: (lower - offset)..<(upper - offset)).map {
+                RecordedKeyPress(time: $0.time + offset, label: $0.label)
+            }
+        }.sorted { $0.time < $1.time }
     }
 
     init(duration: Double, tracks: [TrackKind], pointer: PointerTrace = PointerTrace(), flattened: Bool = false) {
@@ -164,7 +213,8 @@ struct RecordedMedia: Sendable {
     let tracks: [TrackKind]
     let missing: [TrackKind]
     var sourceOffsets: [TrackKind: Double] = [:]
-    var cameraInterrupted = false
+    var interruptedCameras: [TrackKind] = []
+    var cameraNames: [TrackKind: String] = [:]
     var pointer = PointerTrace()
     var personShape: CameraShape = .rounded
     var mirrorCamera = false
@@ -172,6 +222,8 @@ struct RecordedMedia: Sendable {
     var prioritizeNarration = false
     var portraitLighting: PortraitLighting?
     var microphoneGain = 1.0
+    var keyboard: KeyboardTrace?
+    var showsKeyboard: Bool?
 }
 
 struct TakeProject: Sendable {
@@ -196,6 +248,7 @@ struct TakeProject: Sendable {
         let duration = try await durationOfScreen(in: media.folder)
         var manifest = TakeManifest(duration: duration, tracks: media.tracks, pointer: media.pointer)
         manifest.sourceOffsets = media.sourceOffsets
+        if !media.cameraNames.isEmpty { manifest.cameraNames = media.cameraNames.filter { media.tracks.contains($0.key) } }
         manifest.effects.personShape = media.personShape
         manifest.effects.personMirrored = media.mirrorCamera
         manifest.effects.portraitLighting = media.portraitLighting
@@ -204,6 +257,8 @@ struct TakeProject: Sendable {
         }
         manifest.effects.soundChoice = .mechanical
         manifest.cursorAppearance = media.cursorAppearance
+        manifest.keyboard = media.keyboard
+        manifest.effects.showKeyboard = media.showsKeyboard
         if media.prioritizeNarration { manifest.applyNarrationMix() }
         let timeline = try await makeTimeline(from: manifest, in: media.folder)
         return Self(folder: media.folder, isTemporary: true, manifest: timeline)
@@ -240,13 +295,19 @@ struct TakeProject: Sendable {
         guard [1, 2].contains(manifest.version), manifest.duration.isFinite, manifest.duration >= 0.05,
               manifest.tracks.first == .screen, Set(manifest.tracks).count == manifest.tracks.count,
               (manifest.baseTracks?.first ?? .screen) == .screen,
-              manifest.assetFiles.allSatisfy({ isMediaName($0) &&
+              manifest.assetFiles.allSatisfy({ isAssetName($0) &&
                   FileManager.default.fileExists(atPath: url.appendingPathComponent($0).path) }) else {
             throw RecorderError.message("工程格式或素材不完整。")
         }
+        let captions = manifest.subtitleCues
+        guard Set(captions.map(\.id)).count == captions.count,
+              captions.allSatisfy({ $0.start >= 0 && $0.end > $0.start && $0.end.isFinite }) else {
+            throw RecorderError.message("工程的字幕时间线不可读。")
+        }
         if let clips = manifest.clips {
             guard Set(clips.map(\.id)).count == clips.count, clips.allSatisfy({ clip in
-                manifest.tracks.contains(clip.kind) && clip.at >= 0 && clip.length >= TimelineClip.minimumLength - 0.00001 &&
+                isMediaName(clip.file) && manifest.tracks.contains(clip.kind) &&
+                    clip.at >= 0 && clip.length >= TimelineClip.minimumLength - 0.00001 &&
                     clip.sourceStart >= clip.mediaStart - 0.00001 && clip.sourceEnd <= clip.mediaEnd + 0.00001 &&
                     clip.end.isFinite
             }), manifest.tracks.allSatisfy({ kind in
@@ -256,6 +317,13 @@ struct TakeProject: Sendable {
             return Self(folder: url, isTemporary: false, manifest: manifest)
         }
         return Self(folder: url, isTemporary: false, manifest: try await makeTimeline(from: manifest, in: url))
+    }
+
+    private static func isAssetName(_ filename: String) -> Bool {
+        if filename.hasPrefix("background-"), filename.hasSuffix(".png") {
+            return UUID(uuidString: String(filename.dropFirst(11).dropLast(4))) != nil
+        }
+        return isMediaName(filename)
     }
 
     private static func isMediaName(_ filename: String) -> Bool {
@@ -283,7 +351,7 @@ struct TakeProject: Sendable {
             let start = max(edit.start, clock + range.start.seconds, origin - edit.offset)
             let end = min(edit.end, clock + range.end.seconds, limit - edit.offset)
             guard end - start >= TimelineClip.minimumLength - 0.00001 else { continue }
-            clips.append(TimelineClip(kind: kind, file: kind.filename, title: kind.title,
+            clips.append(TimelineClip(kind: kind, file: kind.filename, title: manifest.cameraNames?[kind] ?? kind.title,
                                       mediaStart: range.start.seconds, mediaEnd: range.end.seconds,
                                       sourceStart: start - clock, length: end - start,
                                       at: max(0, start + edit.offset - origin)))
@@ -353,8 +421,10 @@ struct TakeProject: Sendable {
             }
         } else {
             let files = FileManager.default
-            let stage = destination.deletingLastPathComponent().appendingPathComponent(".DeskTake-\(UUID())", isDirectory: true)
-            defer { try? files.removeItem(at: stage) }
+            let stageFolder = try files.url(for: .itemReplacementDirectory, in: .userDomainMask,
+                                            appropriateFor: destination, create: true)
+            defer { try? files.removeItem(at: stageFolder) }
+            let stage = stageFolder.appendingPathComponent("TakeRec.desktake", isDirectory: true)
             try files.createDirectory(at: stage, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
             for filename in settings.assetFiles {
                 try files.copyItem(at: source(filename), to: stage.appendingPathComponent(filename))

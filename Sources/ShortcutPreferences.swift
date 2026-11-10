@@ -4,12 +4,14 @@ import Carbon
 enum ShortcutAction: UInt32, CaseIterable, Identifiable, Codable {
     case start = 1, stop, previousPage, nextPage, togglePrompt
     case playback, save, splitTrack, splitAll, deleteClip, undo
+    case togglePromptScroll, clearKeyDisplay
 
-    static let recording: [Self] = [.start, .stop, .togglePrompt, .previousPage, .nextPage]
+    static let recording: [Self] = [.start, .stop, .togglePrompt, .previousPage, .nextPage, .togglePromptScroll, .clearKeyDisplay]
     static let editing: [Self] = [.playback, .save, .splitTrack, .splitAll, .deleteClip, .undo]
 
     var id: Self { self }
     var isGlobal: Bool { Self.recording.contains(self) }
+    var usesVisiblePrompt: Bool { self == .previousPage || self == .nextPage || self == .togglePromptScroll }
 
     var title: String {
         switch self {
@@ -18,6 +20,8 @@ enum ShortcutAction: UInt32, CaseIterable, Identifiable, Codable {
         case .previousPage: "提词器上一页"
         case .nextPage: "提词器下一页"
         case .togglePrompt: "显示或隐藏提词器"
+        case .togglePromptScroll: "暂停或继续提词滚动"
+        case .clearKeyDisplay: "清空当前按键展示"
         case .playback: "播放 / 暂停预览"
         case .save: "保存工程"
         case .splitTrack: "分割当前轨道"
@@ -35,6 +39,8 @@ enum ShortcutAction: UInt32, CaseIterable, Identifiable, Codable {
         case .previousPage: return ShortcutKey(kVK_LeftArrow, "←", recordingModifiers)
         case .nextPage: return ShortcutKey(kVK_RightArrow, "→", recordingModifiers)
         case .togglePrompt: return ShortcutKey(kVK_ANSI_T, "T", recordingModifiers)
+        case .togglePromptScroll: return ShortcutKey(kVK_ANSI_P, "P", recordingModifiers)
+        case .clearKeyDisplay: return ShortcutKey(kVK_ANSI_K, "K", recordingModifiers)
         case .playback: return ShortcutKey(kVK_Space, "空格")
         case .save: return ShortcutKey(kVK_ANSI_S, "S", cmdKey)
         case .splitTrack: return ShortcutKey(kVK_ANSI_K, "K", cmdKey)
@@ -104,9 +110,81 @@ struct ShortcutKey: Codable, Equatable {
     }
 
     static func modifiers(for event: NSEvent) -> UInt32 {
+        modifiers(for: event.modifierFlags)
+    }
+
+    private static func modifiers(for flags: NSEvent.ModifierFlags) -> UInt32 {
         modifierKeys.reduce(0) { value, modifier in
-            event.modifierFlags.contains(modifier.0) ? value | UInt32(modifier.1) : value
+            flags.contains(modifier.0) ? value | UInt32(modifier.1) : value
         }
+    }
+
+    static func displayedPress(_ event: CGEvent, mode: KeyboardDisplayMode) -> (key: ShortcutKey, label: String)? {
+        let code = Int(event.getIntegerValueField(.keyboardEventKeycode))
+        guard UInt16(exactly: code) != nil else { return nil }
+        let flags = NSEvent.ModifierFlags(rawValue: UInt(event.flags.rawValue))
+        let modifiers = Int(Self.modifiers(for: flags))
+        let isCommand = modifiers & (cmdKey | controlKey) != 0
+        let specialName: String?
+        switch code {
+        case kVK_Escape: specialName = "Esc"
+        case kVK_Tab: specialName = "Tab"
+        default:
+            specialName = functionKeys.firstIndex(of: code).map { "F\($0 + 1)" } ?? specialKeys[code]
+        }
+        if let specialName {
+            guard code != kVK_Space || mode == .all || isCommand else { return nil }
+            let key = ShortcutKey(code, specialName, modifiers)
+            return (key, key.label)
+        }
+        guard mode == .all || isCommand else { return nil }
+        let translatedModifiers = modifiers | (flags.contains(.capsLock) ? alphaLock : 0)
+        let text = isCommand ? nil : keyboardText(for: event)
+        guard let glyph = text ?? keyboardLayoutText(code: UInt16(code), modifiers: isCommand ? 0 : translatedModifiers) else {
+            return nil
+        }
+        let key = ShortcutKey(code, isCommand ? glyph.uppercased() : glyph, modifiers)
+        return (key, isCommand ? key.label : glyph)
+    }
+
+    private static func keyboardText(for event: CGEvent) -> String? {
+        var characters = [UniChar](repeating: 0, count: 8)
+        var length = 0
+        characters.withUnsafeMutableBufferPointer {
+            event.keyboardGetUnicodeString(maxStringLength: $0.count, actualStringLength: &length, unicodeString: $0.baseAddress)
+        }
+        let text = String(decoding: characters.prefix(length), as: UTF16.self)
+        return printableKey(text)
+    }
+
+    private static func keyboardLayoutText(code: UInt16, modifiers: Int) -> String? {
+        let data = layoutData(from: TISCopyCurrentKeyboardLayoutInputSource()?.takeRetainedValue())
+            ?? layoutData(from: TISCopyCurrentASCIICapableKeyboardLayoutInputSource()?.takeRetainedValue())
+        guard let data, let bytes = CFDataGetBytePtr(data) else { return nil }
+        let layout = UnsafeRawPointer(bytes).assumingMemoryBound(to: UCKeyboardLayout.self)
+        var state: UInt32 = 0
+        var length = 0
+        var characters = [UniChar](repeating: 0, count: 8)
+        let result = withExtendedLifetime(data) {
+            characters.withUnsafeMutableBufferPointer {
+                UCKeyTranslate(layout, code, UInt16(kUCKeyActionDown), UInt32((modifiers >> 8) & 0xff),
+                               UInt32(LMGetKbdType()), OptionBits(kUCKeyTranslateNoDeadKeysMask),
+                               &state, $0.count, &length, $0.baseAddress)
+            }
+        }
+        guard result == noErr else { return nil }
+        return printableKey(String(decoding: characters.prefix(length), as: UTF16.self))
+    }
+
+    private static func layoutData(from source: TISInputSource?) -> CFData? {
+        guard let source, let data = TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData) else { return nil }
+        return Unmanaged<CFData>.fromOpaque(data).takeUnretainedValue()
+    }
+
+    private static func printableKey(_ text: String) -> String? {
+        guard let glyph = text.first, text.count == 1, !glyph.isWhitespace, !glyph.isASCIIControl,
+              !glyph.unicodeScalars.contains(where: { (0xf700...0xf8ff).contains($0.value) }) else { return nil }
+        return String(glyph)
     }
 
     static func == (lhs: Self, rhs: Self) -> Bool {

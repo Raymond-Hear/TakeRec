@@ -1,3 +1,4 @@
+#if !TAKEREC_STORE
 import AppKit
 @preconcurrency import AVFoundation
 import Combine
@@ -5,7 +6,7 @@ import WebKit
 
 @MainActor
 final class PhoneLink: NSObject, ObservableObject, WKNavigationDelegate, WKScriptMessageHandler {
-    static let deviceID = "local.takerec.phone-web"
+    nonisolated static let deviceID = "local.takerec.phone-web"
     static let deviceName = "手机网页"
     static let waitingToPair = "扫描二维码连接手机"
     private static let bridge = "takeRecPhone"
@@ -218,3 +219,4 @@ final class PhoneLink: NSObject, ObservableObject, WKNavigationDelegate, WKScrip
         else if hasAudio { status = "已收到手机声音，等待画面" }
     }
 }
+#endif

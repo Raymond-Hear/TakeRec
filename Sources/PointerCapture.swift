@@ -17,7 +17,7 @@ final class PointerCapture {
     private var globalMonitor: Any?
     private var localMonitor: Any?
 
-    init(filter: SCContentFilter, size: CaptureSize, recordsClicks: Bool = true,
+    init(filter: SCContentFilter, size: CaptureSize, recordsClicks: Bool = true, croppedTop: CGFloat = 0,
          coversLocation: @escaping (CGPoint) -> Bool = { _ in false }) {
         canvas = size.dimensions
         self.recordsClicks = recordsClicks
@@ -33,7 +33,9 @@ final class PointerCapture {
         }
         windowID = window?.windowID
         ownerPID = window?.owningApplication?.processID
-        initialBounds = window?.frame ?? display?.frame ?? filter.contentRect
+        let bounds = window?.frame ?? display?.frame ?? filter.contentRect
+        initialBounds = CGRect(x: bounds.minX, y: bounds.minY + croppedTop,
+                               width: bounds.width, height: bounds.height - croppedTop)
     }
 
     func start(at hostTime: Double) {

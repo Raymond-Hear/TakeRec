@@ -2,6 +2,19 @@
 set -euo pipefail
 
 project="$(cd -- "$(dirname -- "$0")" && pwd)"
+bundle_id=local.takerec.community
+entitlements="$project/App/DeskTake.entitlements"
+condition=TAKEREC_DESKTOP
+if [[ "${1:-}" == --store ]]; then
+    shift
+    bundle_id=local.takerec.community.StorePreview
+    entitlements="$project/App/DeskTake-Store.entitlements"
+    condition=TAKEREC_STORE
+    if [[ -z "${1:-}" ]]; then
+        printf '请为商店测试版指定单独的 .app 路径。\n' >&2
+        exit 2
+    fi
+fi
 configuration="${TAKEREC_BUILD_CONFIGURATION:-release}"
 architectures=(arm64 x86_64)
 swift_flags=(-O -file-prefix-map "$project=TakeRec")
@@ -30,7 +43,7 @@ if [[ -L "$app" ]]; then
 fi
 if [[ -e "$app" ]]; then
     identifier="$(plutil -extract CFBundleIdentifier raw -o - "$app/Contents/Info.plist" 2>/dev/null || true)"
-    if [[ "$identifier" != local.takerec.community ]]; then
+    if [[ "$identifier" != "$bundle_id" ]]; then
         printf '目标已存在且属于其他项目，请另选输出路径。\n' >&2
         exit 2
     fi
@@ -51,10 +64,17 @@ trap cleanup EXIT
 bundle="$build/简录.app"
 mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources"
 cp "$project/App/Info.plist" "$bundle/Contents/Info.plist"
+if [[ "$condition" == TAKEREC_STORE ]]; then
+    /usr/bin/plutil -replace CFBundleIdentifier -string "$bundle_id" "$bundle/Contents/Info.plist"
+    /usr/bin/plutil -replace CFBundleDisplayName -string '简录（商店测试）' "$bundle/Contents/Info.plist"
+    /usr/bin/plutil -replace CFBundleName -string '简录（商店测试）' "$bundle/Contents/Info.plist"
+    /usr/bin/plutil -remove NSLocalNetworkUsageDescription "$bundle/Contents/Info.plist"
+fi
 
 assets="$build/Assets.xcassets"
 cp -R "$project/App/Assets.xcassets" "$assets"
-iconset="$assets/TakeRec.appiconset"
+icon_name="$(/usr/libexec/PlistBuddy -c 'Print CFBundleIconName' "$bundle/Contents/Info.plist")"
+iconset="$assets/$icon_name.appiconset"
 mkdir -p "$iconset"
 cp "$project/App/TakeRecIcon.json" "$iconset/Contents.json"
 for size in 16 32 128 256 512; do
@@ -63,29 +83,31 @@ for size in 16 32 128 256 512; do
     sips -z "$pixels" "$pixels" "$project/App/TakeRec.png" --out "$iconset/icon_${size}x${size}@2x.png" >/dev/null
 done
 if ! xcrun actool --compile "$bundle/Contents/Resources" --platform macosx \
-        --minimum-deployment-target 15.0 --target-device mac --app-icon TakeRec \
+        --minimum-deployment-target 15.0 --target-device mac --app-icon "$icon_name" \
         --output-partial-info-plist "$build/asset-info.plist" "$assets" > "$build/actool.log" 2>&1; then
     cat "$build/actool.log" >&2
     exit 1
 fi
 cp "$project/App/Lucide-LICENSE.txt" "$bundle/Contents/Resources/"
-mkdir -p "$bundle/Contents/Resources/PhoneReceiver"
-for file in receiver.html receiver.js vdoninja-sdk.js VDO-Ninja-MPL-2.0.txt; do
-    cp "$project/App/PhoneReceiver/$file" "$bundle/Contents/Resources/PhoneReceiver/"
-done
+cp "$project/LICENSE" "$bundle/Contents/Resources/TakeRec-LICENSE.txt"
+if [[ "$condition" == TAKEREC_DESKTOP ]]; then
+    mkdir -p "$bundle/Contents/Resources/PhoneReceiver"
+    for file in receiver.html receiver.js vdoninja-sdk.js VDO-Ninja-MPL-2.0.txt; do
+        cp "$project/App/PhoneReceiver/$file" "$bundle/Contents/Resources/PhoneReceiver/"
+    done
+fi
 
 sdk="$(xcrun --sdk macosx --show-sdk-path)"
 executables=()
 for arch in "${architectures[@]}"; do
     mkdir -p "$build/$arch"
     executable="$build/$arch/TakeRec"
-    xcrun --sdk macosx swiftc -swift-version 5 "${swift_flags[@]}" -parse-as-library \
+    xcrun --sdk macosx swiftc -swift-version 5 "${swift_flags[@]}" -parse-as-library -D "$condition" \
         -target "$arch-apple-macosx15.0" -sdk "$sdk" \
         -module-cache-path "$build/modules" -module-name TakeRec \
         "$project"/Sources/*.swift -o "$executable"
     executables+=("$executable")
 done
-entitlements="$project/App/DeskTake.entitlements"
 if [[ "$configuration" == debug ]]; then
     mv "${executables[0]}" "$bundle/Contents/MacOS/TakeRec"
     mv "${executables[0]}.dSYM" "$bundle/Contents/Resources/TakeRec.dSYM"

@@ -1,9 +1,14 @@
+#if !TAKEREC_STORE
 @preconcurrency import AVFoundation
 import ImageIO
 
 // The PCM buffer owns its bytes and is never mutated after decoding.
 struct PhoneAudioPacket: @unchecked Sendable {
     let sample: CMSampleBuffer
+}
+
+struct PhoneVideoPacket: @unchecked Sendable {
+    let buffer: CVPixelBuffer
 }
 
 /// The receiver supplies JPEG frames and mono little-endian PCM. A serial queue owns this clock.
@@ -72,3 +77,4 @@ final class PhoneMedia: @unchecked Sendable {
         return sample
     }
 }
+#endif

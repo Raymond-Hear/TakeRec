@@ -80,7 +80,7 @@ enum AgentHandoff {
         let edited = sorted.reversed().reduce(manifest.timelineClips) { clips, cut in
             ClipEdit.removeTime(from: cut.start, to: cut.end, in: clips)
         }
-        guard edited.contains(where: { $0.kind.isVideo && manifest.edit($0.kind).enabled }) else {
+        guard edited.contains(where: { $0.kind.isVideo && manifest.edit($0.kind).enabled && $0.hidden != true }) else {
             throw RecorderError.message("请在剪辑方案中至少保留一段画面。")
         }
         return edited

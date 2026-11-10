@@ -9,44 +9,112 @@ struct TakeEditorView: View {
     var continueRecording: () -> Void = {}
     @State private var showCursorMenu = false
     @State private var pickingFocus = false
-    @State private var inspectorTab = InspectorTab.clip
+    @State private var inspectorVisible = true
+    @State private var inspectorTab = InspectorTab.picture
+    @State private var pictureTab = PictureTab.clip
+    @State private var layoutTab = CanvasInspector.Tab.background
+    @State private var motionTab = MotionTab.zoom
+    @State private var showLighting = false
+    @State private var showMotionTiming = false
+    @State private var showingTranscriptionTools = false
+    @State private var showingAgentEditing = false
+    @State private var tallTimeline = false
+    @State private var timelineHeight: CGFloat?
+    @GestureState private var dividerTranslation: CGFloat = 0
     @StateObject private var fullScreen = FullScreenPreview()
 
     private enum InspectorTab: String, CaseIterable, Identifiable {
-        case clip = "片段", camera = "人像", motion = "运镜", cursor = "光标", click = "点击", audio = "声音"
+        case picture = "画面", motion = "运镜", audio = "声音", captions = "字幕"
+        var id: Self { self }
+        var icon: String {
+            switch self {
+            case .picture: "rectangle"
+            case .motion: "scope"
+            case .audio: "waveform"
+            case .captions: "captions.bubble"
+            }
+        }
+    }
+
+    private enum PictureTab: String, CaseIterable, Identifiable {
+        case clip = "片段", camera = "人像", keyboard = "键盘", layout = "画布"
+        var id: Self { self }
+    }
+
+    private enum MotionTab: String, CaseIterable, Identifiable {
+        case zoom = "点击运镜", cursor = "光标", click = "点击效果"
         var id: Self { self }
     }
 
     var body: some View {
         GeometryReader { geometry in
-            let inspectorWidth = min(355, max(298, geometry.size.width * 0.30))
-            let timelineHeight = min(335, geometry.size.height * 0.40)
+            let inspectorWidth = min(288, max(260, geometry.size.width * 0.25))
+            let naturalHeight = ClipTimelineView.laneContentHeight(trackCount: editor.manifest.tracks.count, tall: tallTimeline,
+                                                                  keyboard: editor.manifest.hasKeyboardTrack)
+            let minimum = min(125, naturalHeight)
+            let maximum = min(naturalHeight, max(minimum, geometry.size.height - 325))
+            let preferred = min(maximum, max(minimum, timelineHeight ?? maximum))
+            let laneHeight = clamp(preferred - dividerTranslation, minimum, maximum)
 
-            VStack(alignment: .leading, spacing: 11) {
-                toolbar
-                HStack(alignment: .top, spacing: 15) {
+            VStack(alignment: .leading, spacing: 0) {
+                toolbar.padding(.bottom, 8)
+                HStack(spacing: 0) {
                     viewer
-                        .frame(minWidth: 490, maxWidth: .infinity, maxHeight: .infinity)
-                    inspector
-                        .frame(width: inspectorWidth)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    if inspectorVisible {
+                        Rectangle().fill(WorkbenchStyle.line).frame(width: 1)
+                        inspector.frame(width: inspectorWidth)
+                    }
                 }
                 .frame(maxHeight: .infinity)
-                ClipTimelineView(editor: editor, shortcuts: shortcuts, maximumLaneHeight: timelineHeight)
-                if let notice = editor.notice {
-                    Text(notice).font(.callout).foregroundStyle(.secondary)
-                        .textSelection(.enabled).lineLimit(2)
+                .workbenchPanel()
+                if maximum > minimum {
+                    timelineDivider(height: preferred, limits: minimum...maximum)
+                } else {
+                    Color.clear.frame(height: 10)
+                }
+                ClipTimelineView(editor: editor, shortcuts: shortcuts, maximumLaneHeight: laneHeight, tall: $tallTimeline,
+                                 showSubtitles: showSubtitles)
+                    .id(ObjectIdentifier(editor))
+                if let activity = editor.activity {
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.small)
+                        Text(activity).font(.caption).foregroundStyle(.secondary)
+                    }
+                    .accessibilityElement(children: .combine)
+                    .padding(.top, 6)
+                } else if let notice = editor.notice {
+                    Text(notice).font(.caption).foregroundStyle(.secondary)
+                        .textSelection(.enabled).lineLimit(2).padding(.top, 6)
                 }
             }
         }
-        .padding(16)
+        .padding(12)
         .frame(minWidth: 900, minHeight: 665)
+        .background(WorkbenchStyle.workspace)
+        .tint(WorkbenchStyle.accent)
         .disabled(editor.isBusy)
         .background(ShortcutEventMonitor(handle: handleKey))
+        .onChange(of: tallTimeline) { _, _ in timelineHeight = nil }
+        .onChange(of: editor.selectedTrack, initial: true) { _, track in
+            pickingFocus = false
+            inspectorTab = track.isVideo ? .picture : .audio
+            pictureTab = track.isCamera ? .camera : (editor.canvas.framing == .portrait ? .layout : .clip)
+        }
+        .onChange(of: editor.selectedSubtitleID) { _, id in
+            if id != nil { showSubtitles() }
+        }
+        .onChange(of: editor.selectedClipID) { _, _ in
+            if editor.selectedClip?.kind.isCamera == true {
+                inspectorTab = .picture
+                pictureTab = .camera
+            }
+        }
         .onDisappear { fullScreen.close() }
     }
 
     private func handleKey(_ event: NSEvent, _ window: NSWindow) -> Bool {
-        guard !editor.isBusy, (window.firstResponder as? NSTextView)?.isEditable != true,
+        guard !editor.isBusy, !showingAgentEditing, (window.firstResponder as? NSTextView)?.isEditable != true,
               let action = shortcuts.action(for: event) else { return false }
         if event.isARepeat { return true }
         switch action {
@@ -55,7 +123,9 @@ struct TakeEditorView: View {
         case .splitTrack, .splitAll:
             let allTracks = action == .splitAll
             if editor.canSplit(allTracks: allTracks) { editor.split(allTracks: allTracks) }
-        case .deleteClip: editor.deleteClip(closeGap: false)
+        case .deleteClip:
+            if editor.selectedSubtitleID != nil { editor.deleteSubtitle() }
+            else { editor.deleteClip(closeGap: false) }
         case .undo: editor.undoClips()
         default: return false
         }
@@ -63,64 +133,152 @@ struct TakeEditorView: View {
     }
 
     private var toolbar: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 9) {
             Button(action: leave) { Label("返回录制", systemImage: "chevron.left") }
             VStack(alignment: .leading, spacing: 1) {
-                Text("录制编辑").font(.headline)
-                Text("\(editor.manifest.tracks.count) 条轨道 · \(editor.manifest.timelineClips.count) 个片段")
+                Text("剪辑工作台").font(.title3.weight(.semibold)).lineLimit(1)
+                Text("\(editor.manifest.timelineClips.count) 个素材片段")
                     .font(.caption).foregroundStyle(.secondary)
             }
-            Spacer()
-            if let activity = editor.activity {
-                ProgressView().controlSize(.small)
-                Text(activity).font(.callout)
-            }
+            .fixedSize(horizontal: true, vertical: false)
+            .padding(.leading, 2)
+            Spacer(minLength: 8)
             if let url = editor.lastExport {
                 Button("播放成片") { NSWorkspace.shared.open(url) }
             }
             Button(action: continueRecording) { Label("继续录制", systemImage: "record.circle") }
-            Button {
-                editor.importMovie()
-            } label: {
-                Label { Text("追加 MP4…") } icon: { DeskIcon("plus", size: 14) }
-            }
-            Menu("Agent 剪辑") {
-                Button("生成素材包并复制提示词…") { editor.makeAgentBundle() }
-                Button("导入剪辑方案…") { editor.importAgentPlan() }
-            }
-            .fixedSize()
             Button("保存工程…") { editor.saveProject() }
                 .help("保存工程 \(shortcuts[.save].label)")
-            Button("导出 MP4…") { editor.export() }.buttonStyle(DeskPrimaryButton())
-            SettingsLink {
-                Label("快捷键设置", systemImage: "keyboard").labelStyle(.iconOnly)
+            Button {
+                showingAgentEditing.toggle()
+            } label: {
+                Label("Agent 剪辑", systemImage: "sparkles")
             }
-            .help("快捷键设置")
+            .help("生成 Agent 素材包或导入剪辑方案")
+            .popover(isPresented: $showingAgentEditing) {
+                AgentEditingPanel(canCreateBundle: editor.canMakeAgentBundle, lastBundle: editor.lastAgentBundle,
+                                  createBundle: { runAgentAction(editor.makeAgentBundle) },
+                                  importPlan: { runAgentAction(editor.importAgentPlan) })
+            }
+            Menu {
+                Button("追加 MP4…") { editor.importMovie() }
+                Divider()
+                SettingsLink { Label("快捷键设置", systemImage: "keyboard") }
+            } label: {
+                Label("更多", systemImage: "ellipsis.circle")
+            }
+            .fixedSize()
+            Button {
+                inspectorVisible.toggle()
+                if !inspectorVisible { pickingFocus = false }
+            } label: {
+                Label("设置", systemImage: "sidebar.right")
+            }
+            .help(inspectorVisible ? "收起编辑设置" : "展开编辑设置")
+            .accessibilityLabel(inspectorVisible ? "收起编辑设置" : "展开编辑设置")
+            Button { editor.export() } label: {
+                Label("导出 MP4…", systemImage: "square.and.arrow.up")
+            }
+            .buttonStyle(DeskPrimaryButton(color: WorkbenchStyle.action))
+            TakeRecAboutButton()
         }
+        .controlSize(.small)
+    }
+
+    private func runAgentAction(_ action: @escaping @MainActor () -> Void) {
+        showingAgentEditing = false
+        Task { @MainActor in action() }
+    }
+
+    private func timelineDivider(height: CGFloat, limits: ClosedRange<CGFloat>) -> some View {
+        Capsule().fill(Color.secondary.opacity(0.40))
+            .frame(width: 38, height: 3)
+            .frame(maxWidth: .infinity)
+            .frame(height: 10)
+            .contentShape(Rectangle())
+            .help("上下拖动调整预览高度，双击恢复默认")
+            .gesture(DragGesture(minimumDistance: 2, coordinateSpace: .global)
+                .updating($dividerTranslation) { value, translation, _ in
+                    translation = value.translation.height
+                }
+                .onEnded { value in
+                    timelineHeight = clamp(height - value.translation.height, limits.lowerBound, limits.upperBound)
+                })
+            .onTapGesture(count: 2) { timelineHeight = nil }
+            .accessibilityLabel("预览和时间线之间的分隔柄")
+            .accessibilityAdjustableAction { direction in
+                switch direction {
+                case .increment: timelineHeight = min(limits.upperBound, height + 24)
+                case .decrement: timelineHeight = max(limits.lowerBound, height - 24)
+                @unknown default: break
+                }
+            }
     }
 
     private var viewer: some View {
         GeometryReader { geometry in
-            let transportHeight: CGFloat = 30
-            let gap: CGFloat = 7
-            let available = CGSize(width: geometry.size.width,
-                                   height: max(0, geometry.size.height - transportHeight - gap))
+            let controlsHeight: CGFloat = 34
+            let available = CGSize(width: max(0, geometry.size.width - 16),
+                                   height: max(0, geometry.size.height - controlsHeight - 14))
             let imageSize = PreviewGeometry.fit(editor.previewSize, in: available)
-            let transportWidth = max(imageSize.width, min(350, geometry.size.width))
-
-            VStack(spacing: gap) {
+            let controlsWidth = min(available.width, max(imageSize.width, 380))
+            VStack(spacing: 5) {
                 preview(size: imageSize)
-                transport
-                    .frame(width: transportWidth, height: transportHeight)
+                playbackControls
+                    .frame(width: controlsWidth, height: controlsHeight)
             }
-            .frame(width: geometry.size.width, height: geometry.size.height, alignment: .bottom)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .frame(minHeight: 226)
+    }
+
+    private var playbackControls: some View {
+        HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 1) {
+                Text("成片预览").font(.callout.weight(.semibold))
+                if editor.previewReady {
+                    Text("\(Int(editor.previewSize.width)) × \(Int(editor.previewSize.height))")
+                        .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                }
+            }
+            .fixedSize(horizontal: true, vertical: false)
+            Spacer(minLength: 4)
+            Menu {
+                ForEach(OutputFraming.allCases) { framing in
+                    Button {
+                        editor.canvas.framing = framing
+                        if framing == .portrait {
+                            inspectorVisible = true
+                            inspectorTab = .picture
+                            pictureTab = .layout
+                            layoutTab = .background
+                            pickingFocus = false
+                        }
+                    } label: {
+                        if editor.canvas.framing == framing { Label(framing.title, systemImage: "checkmark") }
+                        else { Text(framing.title) }
+                    }
+                }
+            } label: {
+                Text(editor.canvas.framing.title).lineLimit(1)
+            }
+            .fixedSize()
+            .accessibilityLabel("成片比例")
+            .help("切换成片画布比例")
+            transport
+            Button { fullScreen.show(editor: editor, shortcuts: shortcuts) } label: {
+                Image(systemName: "arrow.up.left.and.arrow.down.right")
+                    .frame(width: 16, height: 16)
+            }
+            .disabled(!editor.previewReady)
+            .help("全屏预览")
+            .accessibilityLabel("全屏预览")
+        }
+        .controlSize(.small)
     }
 
     private func preview(size: CGSize) -> some View {
         ZStack(alignment: .top) {
-            Color.secondary.opacity(0.09)
+            WorkbenchStyle.canvas
             if editor.previewReady && !fullScreen.isPresented {
                 PlayerSurface(player: editor.player)
                     .frame(width: size.width, height: size.height)
@@ -146,18 +304,15 @@ struct TakeEditorView: View {
                     fullScreen.show(editor: editor, shortcuts: shortcuts)
                 } label: {
                     Color.clear.contentShape(Rectangle())
-                        .overlay(alignment: .topTrailing) {
-                            Image(systemName: "arrow.up.left.and.arrow.down.right")
-                                .font(.system(size: 13, weight: .semibold)).foregroundStyle(.white)
-                                .padding(8).background(.black.opacity(0.65), in: RoundedRectangle(cornerRadius: 6))
-                                .padding(8)
-                        }
                 }
                 .buttonStyle(.plain).help("点击画面全屏预览").accessibilityLabel("全屏预览")
             }
         }
         .frame(width: size.width, height: size.height)
-        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .clipShape(RoundedRectangle(cornerRadius: 5))
+        .overlay {
+            RoundedRectangle(cornerRadius: 5).strokeBorder(WorkbenchStyle.line).allowsHitTesting(false)
+        }
         .accessibilityLabel("成片预览")
     }
 
@@ -191,38 +346,108 @@ struct TakeEditorView: View {
     }
 
     private var inspector: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Picker("编辑设置", selection: $inspectorTab) {
-                ForEach(InspectorTab.allCases) { Text($0.rawValue).tag($0) }
+        VStack(spacing: 0) {
+            HStack {
+                Text("编辑设置").font(.headline)
+                Spacer()
+                Button {
+                    inspectorVisible = false
+                    pickingFocus = false
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.caption.weight(.semibold))
+                        .frame(width: 26, height: 26)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .help("收起设置")
+                .accessibilityLabel("收起设置")
             }
-            .pickerStyle(.segmented)
-            .labelsHidden()
+            .padding(.horizontal, 12)
+            .frame(height: 38)
+            HStack(spacing: 3) {
+                ForEach(InspectorTab.allCases) { tab in
+                    let selected = inspectorTab == tab
+                    Button {
+                        inspectorTab = tab
+                        if tab != .motion { pickingFocus = false }
+                    } label: {
+                        Label(tab.rawValue, systemImage: tab.icon)
+                            .font(.callout.weight(selected ? .semibold : .medium))
+                            .foregroundStyle(selected ? WorkbenchStyle.accent : .secondary)
+                            .frame(maxWidth: .infinity, minHeight: 27)
+                            .background(selected ? WorkbenchStyle.accent.opacity(0.10) : .clear,
+                                        in: RoundedRectangle(cornerRadius: 5))
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityAddTraits(selected ? .isSelected : [])
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.bottom, 8)
+            Rectangle().fill(WorkbenchStyle.line).frame(height: 1)
+            ViewThatFits(in: .vertical) {
+                inspectorControls.fixedSize(horizontal: false, vertical: true)
+                ScrollView { inspectorControls }
+            }
+            .frame(maxHeight: .infinity, alignment: .top)
+        }
+    }
+
+    private var inspectorControls: some View {
+        VStack(alignment: .leading, spacing: 8) {
             switch inspectorTab {
-            case .clip: trackInspector
-            case .camera: cameraInspector
-            case .motion: motionInspector
-            case .cursor: cursorInspector
-            case .click: clickInspector
+            case .picture:
+                Picker("画面设置", selection: $pictureTab) {
+                    ForEach(PictureTab.allCases) {
+                        Text($0.rawValue).tag($0)
+                    }
+                }
+                .pickerStyle(.segmented).labelsHidden()
+                switch pictureTab {
+                case .clip: trackInspector
+                case .camera: cameraInspector
+                case .keyboard: keyboardInspector
+                case .layout: CanvasInspector(editor: editor, tab: $layoutTab)
+                }
+            case .motion:
+                Picker("运镜设置", selection: $motionTab) {
+                    ForEach(MotionTab.allCases) { Text($0.rawValue).tag($0) }
+                }
+                .pickerStyle(.segmented).labelsHidden()
+                switch motionTab {
+                case .zoom: motionInspector
+                case .cursor: cursorInspector
+                case .click: clickInspector
+                }
             case .audio: audioInspector
+            case .captions: SubtitleInspector(editor: editor, showingTranscriptionTools: $showingTranscriptionTools)
             }
         }
-        .fixedSize(horizontal: false, vertical: true)
+        .controlSize(.small)
+        .padding(12)
+    }
+
+    private func showSubtitles() {
+        pickingFocus = false
+        inspectorVisible = true
+        inspectorTab = .captions
     }
 
     private func section<Content: View>(_ title: String, icon: String,
                                         @ViewBuilder content: () -> Content) -> some View {
-        VStack(alignment: .leading, spacing: 9) {
+        VStack(alignment: .leading, spacing: 7) {
             Label { Text(title).font(.subheadline.weight(.semibold)) } icon: { DeskIcon(icon) }
             content()
         }
-        .padding(11)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.quaternary.opacity(0.55), in: RoundedRectangle(cornerRadius: 8))
     }
 
     private var trackInspector: some View {
         let kind = editor.selectedTrack
-        return section(kind.title + "轨", icon: kind.icon) {
+        return section(editor.manifest.trackTitle(kind) + "轨", icon: kind.icon) {
             if let clip = editor.selectedClip {
                 Text(clip.title).font(.subheadline.weight(.semibold)).lineLimit(1)
                 Text("位置 \(timelineTime(clip.at)) · 时长 \(timelineTime(clip.length))")
@@ -244,29 +469,79 @@ struct TakeEditorView: View {
     }
 
     private var cameraInspector: some View {
-        section("人像", icon: "video") {
-            if editor.manifest.tracks.contains(.camera) {
-                Toggle("镜像人像", isOn: Binding(get: { editor.manifest.effects.cameraMirrored },
-                                                  set: { editor.manifest.effects.personMirrored = $0 }))
-                Picker("形状", selection: Binding(get: { editor.manifest.effects.cameraShape },
-                                                    set: { editor.manifest.effects.personShape = $0 })) {
-                    ForEach(CameraShape.allCases) { Text($0.rawValue).tag($0) }
+        let angles = editor.manifest.cameraTracks
+        let selection = angles.contains(editor.selectedTrack) ? editor.selectedTrack : angles.first
+        return section(angles.count > 1 ? "人像机位" : "人像", icon: "video") {
+            if let kind = selection {
+                if angles.count > 1 {
+                    Picker("机位", selection: Binding(get: { kind }, set: editor.selectTrack)) {
+                        ForEach(angles) { Text(editor.manifest.trackDescription($0)).tag($0) }
+                    }
+                    Toggle("显示此机位", isOn: Binding(
+                        get: { editor.manifest.edit(kind).enabled }, set: { editor.setTrackEnabled(kind, $0) }
+                    ))
+                    Button("从播放头切到此机位") { editor.switchCamera(to: kind) }
+                        .disabled(!editor.canSwitchCamera(to: kind))
+                        .help("从播放头到此机位片段结束，只显示这一机位。可撤销。")
                 }
-                Picker("位置", selection: $editor.manifest.effects.cameraCorner) {
-                    ForEach(CameraCorner.allCases) { Text($0.rawValue).tag($0) }
+                if let clip = editor.selectedClip, clip.kind == kind {
+                    Toggle("显示所选片段", isOn: Binding(
+                        get: { clip.hidden != true }, set: { editor.setCameraClipVisible(clip, $0) }
+                    ))
+                    .disabled(!editor.manifest.edit(kind).enabled)
                 }
-                adjust("人像尺寸", value: $editor.manifest.effects.cameraSize, range: 0.12...0.55,
-                       text: percent(editor.manifest.effects.cameraSize))
-                Divider()
-                PortraitLightingControls(lighting: Binding(
-                    get: { editor.manifest.effects.portraitLighting ?? PortraitLighting() },
-                    set: { editor.manifest.effects.portraitLighting = $0 == PortraitLighting() ? nil : $0 }
+                Toggle(angles.count > 1 ? "镜像此机位" : "镜像人像", isOn: Binding(
+                    get: { editor.manifest.cameraMirrored(kind) }, set: { editor.setCameraMirror(kind, $0) }
                 ))
+                if editor.canvas.framing == .portrait {
+                    Button("调整竖屏人像布局…") {
+                        layoutTab = .camera
+                        pictureTab = .layout
+                    }
+                } else {
+                    Picker("形状", selection: Binding(get: { editor.manifest.effects.cameraShape },
+                                                        set: { editor.manifest.effects.personShape = $0 })) {
+                        ForEach(CameraShape.allCases) { Text($0.rawValue).tag($0) }
+                    }
+                    Picker(angles.count > 1 ? "并排位置" : "位置", selection: $editor.manifest.effects.cameraCorner) {
+                        ForEach(CameraCorner.allCases) { Text($0.rawValue).tag($0) }
+                    }
+                    adjust("人像尺寸", value: $editor.manifest.effects.cameraSize, range: 0.12...0.55,
+                           text: percent(editor.manifest.effects.cameraSize))
+                }
+                Button("人像调光…") { showLighting.toggle() }
+                    .popover(isPresented: $showLighting, arrowEdge: .bottom) {
+                        PortraitLightingControls(lighting: Binding(
+                            get: { editor.manifest.effects.portraitLighting ?? PortraitLighting() },
+                            set: { editor.manifest.effects.portraitLighting = $0 == PortraitLighting() ? nil : $0 }
+                        ))
+                        .padding(14).frame(width: 280)
+                    }
             } else {
                 Text("录制时开启摄像头，即可编辑独立人像。")
                     .font(.callout).foregroundStyle(.secondary)
             }
         }
+    }
+
+    private var keyboardInspector: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if editor.manifest.hasKeyboardTrack {
+                Toggle("显示按键轨", isOn: $editor.keyboardVisible)
+                Picker("位置", selection: $editor.manifest.effects.keyboardCorner) {
+                    Text("沿用录制位置").tag(nil as CameraCorner?)
+                    ForEach(CameraCorner.allCases) { Text($0.rawValue).tag(Optional($0)) }
+                }
+                .disabled(editor.manifest.effects.showKeyboard == false)
+                if !editor.manifest.hasKeyboardPresses {
+                    Text("当前片段没有收到按键。").font(.caption).foregroundStyle(.secondary)
+                }
+            } else {
+                Text("这段素材没有按键记录。录制前开启「保留按键轨」，剪辑时即可选择显示。")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private func trim(_ clip: TimelineClip, left: Bool) {
@@ -280,11 +555,19 @@ struct TakeEditorView: View {
             Toggle("点击自动运镜", isOn: $editor.manifest.effects.autoZoom)
             Toggle("放大时跟随光标", isOn: $editor.manifest.effects.followPointer)
             adjust("放大倍率", value: $editor.manifest.effects.zoom, range: 1...3, text: String(format: "%.2f×", effect.zoom))
-            adjust("过渡用时", value: $editor.manifest.effects.transition, range: 0.12...1.2, text: String(format: "%.2f s", effect.transition))
-            adjust("放大停留", value: $editor.manifest.effects.hold, range: 0.15...3, text: String(format: "%.2f s", effect.hold))
-            adjust("过渡虚化", value: $editor.manifest.effects.blur, range: 0...10, text: String(format: "%.1f", effect.blur))
-            Divider()
             focusControls
+            Button("过渡与停留…") { showMotionTiming.toggle() }
+                .popover(isPresented: $showMotionTiming, arrowEdge: .bottom) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        adjust("过渡用时", value: $editor.manifest.effects.transition, range: 0.12...1.2,
+                               text: String(format: "%.2f s", editor.manifest.effects.transition))
+                        adjust("放大停留", value: $editor.manifest.effects.hold, range: 0.15...3,
+                               text: String(format: "%.2f s", editor.manifest.effects.hold))
+                        adjust("过渡虚化", value: $editor.manifest.effects.blur, range: 0...10,
+                               text: String(format: "%.1f", editor.manifest.effects.blur))
+                    }
+                    .padding(14).frame(width: 290)
+                }
         }
     }
 
