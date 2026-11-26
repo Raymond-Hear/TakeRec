@@ -9,7 +9,7 @@ struct AgentEditingPanel: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Label("Agent 剪辑", systemImage: "sparkles").font(.headline)
-            Text("把当前工程和分轨原片打包到你选的文件夹，再把提示词粘贴给你的 Agent。")
+            Text("把当前工程和分轨原片打包到你选的文件夹，再把提示词粘贴给你的 Agent。再次生成会更新同一个素材包，只补齐新增素材，不再整包复制。")
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 

@@ -69,7 +69,7 @@ extension TrackKind {
     var icon: String {
         switch self {
         case .screen: "monitor"
-        case .camera, .camera2, .camera3: "video"
+        case .camera, .camera2, .camera3, .bRoll: "video"
         case .microphone: "mic"
         case .system, .originalAudio: "audio-lines"
         }
@@ -84,6 +84,7 @@ extension TrackKind {
         case .system: WorkbenchStyle.adaptive(0x2D797D, 0x8BD8D7)
         case .microphone: WorkbenchStyle.adaptive(0x46753F, 0xA8D38E)
         case .originalAudio: WorkbenchStyle.adaptive(0x675A9C, 0xB8ACE9)
+        case .bRoll: WorkbenchStyle.adaptive(0x267464, 0x80D6C4)
         }
     }
 }

@@ -35,6 +35,27 @@ struct SubtitleStyle: Codable, Equatable, Sendable {
     var backdrop = 0.66
 }
 
+struct TitleAppearance: Codable, Equatable, Sendable {
+    enum Position: String, Codable, CaseIterable {
+        case top = "顶部", center = "居中", lower = "下方"
+    }
+
+    enum Tone: String, Codable, CaseIterable {
+        case white = "亮白", yellow = "暖黄", mint = "薄荷绿"
+
+        var color: CGColor {
+            switch self {
+            case .white: return CGColor(gray: 1, alpha: 1)
+            case .yellow: return CGColor(red: 1, green: 0.84, blue: 0.38, alpha: 1)
+            case .mint: return CGColor(red: 0.52, green: 1, blue: 0.80, alpha: 1)
+            }
+        }
+    }
+
+    var position = Position.top
+    var tone = Tone.yellow
+}
+
 enum SubtitleImport {
     static func read(_ url: URL, duration: Double) throws -> (cues: [SubtitleCue], needsTiming: Bool) {
         let size = try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
@@ -124,9 +145,10 @@ final class SubtitleArtwork: @unchecked Sendable {
     private let cues: [SubtitleCue]
     private let maximumEnds: [Double]
     private let style: SubtitleStyle
+    private let title: TitleAppearance?
     private let cache = NSCache<NSString, CIImage>()
 
-    init(cues: [SubtitleCue], style: SubtitleStyle) {
+    init(cues: [SubtitleCue], style: SubtitleStyle, title: TitleAppearance? = nil) {
         self.cues = cues.filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
             .sorted { ($0.start, $0.end) < ($1.start, $1.end) }
         var maxEnd = 0.0
@@ -135,6 +157,7 @@ final class SubtitleArtwork: @unchecked Sendable {
             return maxEnd
         }
         self.style = style
+        self.title = title
         cache.countLimit = 36
         cache.totalCostLimit = 48 * 1024 * 1024
     }
@@ -150,7 +173,13 @@ final class SubtitleArtwork: @unchecked Sendable {
             cache.setObject(drawn, forKey: key, cost: Int(drawn.extent.width * drawn.extent.height * 4))
             image = drawn
         }
-        let bottom = portrait ? canvas.height * 0.417 - image.extent.height : canvas.height * 0.07
+        let bottom: CGFloat
+        switch title?.position {
+        case .top: bottom = canvas.height * 0.88 - image.extent.height
+        case .center: bottom = (canvas.height - image.extent.height) / 2
+        case .lower: bottom = canvas.height * 0.22
+        case nil: bottom = portrait ? canvas.height * 0.417 - image.extent.height : canvas.height * 0.07
+        }
         return image.transformed(by: CGAffineTransform(translationX: (canvas.width - image.extent.width) / 2, y: bottom))
     }
 
@@ -171,9 +200,9 @@ final class SubtitleArtwork: @unchecked Sendable {
 
     private func draw(_ text: String, canvas: CGRect, portrait: Bool) -> CIImage? {
         let scale = min(canvas.width, canvas.height) / 1080
-        let inset = max(3, round(12 * scale))
+        let inset = max(3, round((title == nil ? 12 : 24) * scale))
         let maxWidth = floor(canvas.width * 0.90) - 2 * inset
-        let maxHeight = floor(canvas.height * (portrait ? 0.14 : 0.30)) - 2 * inset
+        let maxHeight = floor(canvas.height * (portrait && title == nil ? 0.14 : 0.30)) - 2 * inset
         guard maxWidth > 0, maxHeight > 0 else { return nil }
         var size = max(7, clamp(style.size, 20, 104) * scale)
         var measured = CGSize.zero
@@ -222,7 +251,7 @@ final class SubtitleArtwork: @unchecked Sendable {
         }
         let attributed = NSAttributedString(string: text, attributes: [
             NSAttributedString.Key(kCTFontAttributeName as String): font,
-            NSAttributedString.Key(kCTForegroundColorAttributeName as String): CGColor(gray: 1, alpha: 1),
+            NSAttributedString.Key(kCTForegroundColorAttributeName as String): title?.tone.color ?? CGColor(gray: 1, alpha: 1),
             NSAttributedString.Key(kCTParagraphStyleAttributeName as String): paragraph
         ])
         return CTFramesetterCreateWithAttributedString(attributed)

@@ -51,6 +51,7 @@ enum MovieExport {
         var screenID: CMPersistentTrackID?
         var screens: [VideoSpan] = []
         var cameras: [CameraVideoLane] = []
+        var bRoll: CameraVideoLane?
         var levels: [(kind: TrackKind?, track: AVCompositionTrack, gain: Double)] = []
 
         for kind in manifest.tracks {
@@ -94,7 +95,7 @@ enum MovieExport {
                                              motion: motion(for: clip, manifest: manifest),
                                              drawsCursor: recording?.drawsEditableCursor == true,
                                              keyboard: recording?.keyboard))
-                } else if kind.isCamera && edit.enabled && clip.hidden != true {
+                } else if (kind.isCamera || kind == .bRoll) && edit.enabled && clip.hidden != true {
                     cameraSpans.append(VideoSpan(clip: clip, transform: try await source.load(.preferredTransform)))
                 }
             }
@@ -104,7 +105,9 @@ enum MovieExport {
             }
             if kind.isVideo {
                 if kind == .screen { screenID = destination.trackID }
-                else {
+                else if kind == .bRoll {
+                    bRoll = CameraVideoLane(id: destination.trackID, spans: cameraSpans, mirrored: false)
+                } else {
                     cameras.append(CameraVideoLane(id: destination.trackID, spans: cameraSpans,
                                                    mirrored: manifest.cameraMirrored(kind)))
                 }
@@ -113,7 +116,7 @@ enum MovieExport {
             }
         }
 
-        guard audioOnly || screenID != nil || !cameras.isEmpty else {
+        guard audioOnly || screenID != nil || !cameras.isEmpty || bRoll != nil else {
             throw RecorderError.message("无法建立画面时间线。")
         }
         if manifest.effects.clickSound {
@@ -136,11 +139,14 @@ enum MovieExport {
         let presentation = manifest.canvasSettings
         let background = try audioOnly ? nil : backgroundImage(for: project, settings: presentation)
         let instruction = TakeInstruction(timeRange: CMTimeRange(start: .zero, duration: length),
-                                          screenID: screenID, screens: screens, cameras: cameras,
+                                          screenID: screenID, screens: screens, cameras: cameras, bRoll: bRoll,
                                           settings: manifest.effects, presentation: presentation,
                                           sourceAspect: baseSize.width / baseSize.height, background: background,
                                           captions: SubtitleArtwork(cues: audioOnly ? [] : manifest.subtitleCues,
-                                                                    style: manifest.captionStyle))
+                                                                    style: manifest.captionStyle),
+                                          titles: SubtitleArtwork(cues: audioOnly ? [] : manifest.titleCues,
+                                                                  style: SubtitleStyle(size: 94, backdrop: 0.86),
+                                                                  title: manifest.titleAppearance ?? TitleAppearance()))
         let video = AVMutableVideoComposition()
         video.customVideoCompositorClass = TakeCompositor.self
         video.renderSize = try presentation.renderSize(source: baseSize, scale: canvasScale, resolution: resolution, proxy: proxy)
@@ -190,7 +196,7 @@ enum MovieExport {
         return track
     }
 
-    private static func orientedSize(for track: AVAssetTrack) async throws -> CGSize {
+    static func orientedSize(for track: AVAssetTrack) async throws -> CGSize {
         let transform = try await track.load(.preferredTransform)
         let size = try await track.load(.naturalSize)
         return CGRect(origin: .zero, size: size).applying(transform).standardized.size

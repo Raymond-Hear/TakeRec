@@ -7,6 +7,7 @@ struct TakeEditorView: View {
     @ObservedObject var shortcuts: ShortcutPreferences
     let leave: () -> Void
     var continueRecording: () -> Void = {}
+    var firstTakeStep: FirstTakeStep? = nil
     @State private var showCursorMenu = false
     @State private var pickingFocus = false
     @State private var inspectorVisible = true
@@ -17,7 +18,9 @@ struct TakeEditorView: View {
     @State private var showLighting = false
     @State private var showMotionTiming = false
     @State private var showingTranscriptionTools = false
+    @State private var showingProofreading = false
     @State private var showingAgentEditing = false
+    @AppStorage("TakeRec.Timeline.CloseGapsOnDelete") private var autoCloseGaps = true
     @State private var tallTimeline = false
     @State private var timelineHeight: CGFloat?
     @GestureState private var dividerTranslation: CGFloat = 0
@@ -37,7 +40,7 @@ struct TakeEditorView: View {
     }
 
     private enum PictureTab: String, CaseIterable, Identifiable {
-        case clip = "片段", camera = "人像", keyboard = "键盘", layout = "画布"
+        case clip = "片段", camera = "人像", keyboard = "键盘", layout = "画布", titles = "花字"
         var id: Self { self }
     }
 
@@ -50,7 +53,8 @@ struct TakeEditorView: View {
         GeometryReader { geometry in
             let inspectorWidth = min(288, max(260, geometry.size.width * 0.25))
             let naturalHeight = ClipTimelineView.laneContentHeight(trackCount: editor.manifest.tracks.count, tall: tallTimeline,
-                                                                  keyboard: editor.manifest.hasKeyboardTrack)
+                                                                  keyboard: editor.manifest.hasKeyboardTrack,
+                                                                  titles: !editor.manifest.titleCues.isEmpty)
             let minimum = min(125, naturalHeight)
             let maximum = min(naturalHeight, max(minimum, geometry.size.height - 325))
             let preferred = min(maximum, max(minimum, timelineHeight ?? maximum))
@@ -63,19 +67,22 @@ struct TakeEditorView: View {
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                     if inspectorVisible {
                         Rectangle().fill(WorkbenchStyle.line).frame(width: 1)
-                        inspector.frame(width: inspectorWidth)
+                        inspector.frame(width: inspectorWidth).disabled(firstTakeInProgress)
                     }
                 }
                 .frame(maxHeight: .infinity)
                 .workbenchPanel()
                 if maximum > minimum {
                     timelineDivider(height: preferred, limits: minimum...maximum)
+                        .allowsHitTesting(!firstTakeInProgress)
+                        .accessibilityHidden(firstTakeInProgress)
                 } else {
                     Color.clear.frame(height: 10)
                 }
                 ClipTimelineView(editor: editor, shortcuts: shortcuts, maximumLaneHeight: laneHeight, tall: $tallTimeline,
-                                 showSubtitles: showSubtitles)
+                                 autoCloseGaps: $autoCloseGaps, showSubtitles: showSubtitles, showTitles: showTitles)
                     .id(ObjectIdentifier(editor))
+                    .disabled(firstTakeInProgress)
                 if let activity = editor.activity {
                     HStack(spacing: 6) {
                         ProgressView().controlSize(.small)
@@ -94,7 +101,9 @@ struct TakeEditorView: View {
         .background(WorkbenchStyle.workspace)
         .tint(WorkbenchStyle.accent)
         .disabled(editor.isBusy)
+        .firstTakeSpotlight(firstTakeTarget, note: editor.notice, shade: editor.playing ? 0.22 : 0.46)
         .background(ShortcutEventMonitor(handle: handleKey))
+        .sheet(isPresented: $showingProofreading) { SubtitleProofreadingView(editor: editor) }
         .onChange(of: tallTimeline) { _, _ in timelineHeight = nil }
         .onChange(of: editor.selectedTrack, initial: true) { _, track in
             pickingFocus = false
@@ -113,20 +122,35 @@ struct TakeEditorView: View {
         .onDisappear { fullScreen.close() }
     }
 
+    private var firstTakeInProgress: Bool { firstTakeStep == .review || firstTakeStep == .export }
+
+    private var firstTakeTarget: FirstTakeTarget? {
+        guard !editor.isBusy else { return nil }
+        return switch firstTakeStep {
+        case .review: .play
+        case .export: .export
+        default: nil
+        }
+    }
+
     private func handleKey(_ event: NSEvent, _ window: NSWindow) -> Bool {
         guard !editor.isBusy, !showingAgentEditing, (window.firstResponder as? NSTextView)?.isEditable != true,
               let action = shortcuts.action(for: event) else { return false }
         if event.isARepeat { return true }
+        if firstTakeInProgress {
+            if action == .playback, firstTakeStep == .review || editor.playing { togglePlayback() }
+            return true
+        }
         switch action {
         case .playback: togglePlayback()
         case .save: editor.saveProject()
         case .splitTrack, .splitAll:
             let allTracks = action == .splitAll
             if editor.canSplit(allTracks: allTracks) { editor.split(allTracks: allTracks) }
-        case .deleteClip:
-            if editor.selectedSubtitleID != nil { editor.deleteSubtitle() }
-            else { editor.deleteClip(closeGap: false) }
+        case .deleteClip: editor.deleteSelection(closeGap: autoCloseGaps)
         case .undo: editor.undoClips()
+        case .redo: editor.redoClips()
+        case .pasteMedia: editor.pasteMovies()
         default: return false
         }
         return true
@@ -135,6 +159,7 @@ struct TakeEditorView: View {
     private var toolbar: some View {
         HStack(spacing: 9) {
             Button(action: leave) { Label("返回录制", systemImage: "chevron.left") }
+                .disabled(firstTakeInProgress)
             VStack(alignment: .leading, spacing: 1) {
                 Text("剪辑工作台").font(.title3.weight(.semibold)).lineLimit(1)
                 Text("\(editor.manifest.timelineClips.count) 个素材片段")
@@ -147,7 +172,9 @@ struct TakeEditorView: View {
                 Button("播放成片") { NSWorkspace.shared.open(url) }
             }
             Button(action: continueRecording) { Label("继续录制", systemImage: "record.circle") }
+                .disabled(firstTakeInProgress)
             Button("保存工程…") { editor.saveProject() }
+                .disabled(firstTakeInProgress)
                 .help("保存工程 \(shortcuts[.save].label)")
             Button {
                 showingAgentEditing.toggle()
@@ -155,6 +182,7 @@ struct TakeEditorView: View {
                 Label("Agent 剪辑", systemImage: "sparkles")
             }
             .help("生成 Agent 素材包或导入剪辑方案")
+            .disabled(firstTakeInProgress)
             .popover(isPresented: $showingAgentEditing) {
                 AgentEditingPanel(canCreateBundle: editor.canMakeAgentBundle, lastBundle: editor.lastAgentBundle,
                                   createBundle: { runAgentAction(editor.makeAgentBundle) },
@@ -162,12 +190,15 @@ struct TakeEditorView: View {
             }
             Menu {
                 Button("追加 MP4…") { editor.importMovie() }
+                Button("粘贴 MP4 素材") { editor.pasteMovies() }
+                    .help("从访达复制 MP4，再按 \(shortcuts[.pasteMedia].label) 粘贴。")
                 Divider()
                 SettingsLink { Label("快捷键设置", systemImage: "keyboard") }
             } label: {
                 Label("更多", systemImage: "ellipsis.circle")
             }
             .fixedSize()
+            .disabled(firstTakeInProgress)
             Button {
                 inspectorVisible.toggle()
                 if !inspectorVisible { pickingFocus = false }
@@ -176,11 +207,14 @@ struct TakeEditorView: View {
             }
             .help(inspectorVisible ? "收起编辑设置" : "展开编辑设置")
             .accessibilityLabel(inspectorVisible ? "收起编辑设置" : "展开编辑设置")
+            .disabled(firstTakeInProgress)
             Button { editor.export() } label: {
                 Label("导出 MP4…", systemImage: "square.and.arrow.up")
             }
             .buttonStyle(DeskPrimaryButton(color: WorkbenchStyle.action))
-            TakeRecAboutButton()
+            .disabled(firstTakeStep == .review)
+            .firstTakeTarget(.export)
+            TakeRecAboutButton().disabled(firstTakeInProgress)
         }
         .controlSize(.small)
     }
@@ -264,12 +298,13 @@ struct TakeEditorView: View {
             .fixedSize()
             .accessibilityLabel("成片比例")
             .help("切换成片画布比例")
+            .disabled(firstTakeInProgress)
             transport
             Button { fullScreen.show(editor: editor, shortcuts: shortcuts) } label: {
                 Image(systemName: "arrow.up.left.and.arrow.down.right")
                     .frame(width: 16, height: 16)
             }
-            .disabled(!editor.previewReady)
+            .disabled(!editor.previewReady || firstTakeInProgress)
             .help("全屏预览")
             .accessibilityLabel("全屏预览")
         }
@@ -306,6 +341,7 @@ struct TakeEditorView: View {
                     Color.clear.contentShape(Rectangle())
                 }
                 .buttonStyle(.plain).help("点击画面全屏预览").accessibilityLabel("全屏预览")
+                .disabled(firstTakeInProgress)
             }
         }
         .frame(width: size.width, height: size.height)
@@ -317,7 +353,8 @@ struct TakeEditorView: View {
     }
 
     private var transport: some View {
-        PreviewTransport(editor: editor, playbackKey: shortcuts[.playback].label, togglePlayback: togglePlayback)
+        PreviewTransport(editor: editor, playbackKey: shortcuts[.playback].label, togglePlayback: togglePlayback,
+                         firstTakeStep: firstTakeStep)
     }
 
     private func togglePlayback() {
@@ -336,9 +373,7 @@ struct TakeEditorView: View {
                 editor.seek(to: editor.playhead)
                 pickingFocus.toggle()
             }
-            .disabled(!editor.previewReady || !editor.manifest.timelineClips.contains {
-                $0.kind == .screen && $0.contains(editor.playhead)
-            })
+            .disabled(!editor.canPickFocus)
             Button("移除焦点") { editor.removeFocus() }.disabled(editor.nearestFocus() == nil)
             Spacer(minLength: 0)
         }
@@ -411,6 +446,7 @@ struct TakeEditorView: View {
                 case .camera: cameraInspector
                 case .keyboard: keyboardInspector
                 case .layout: CanvasInspector(editor: editor, tab: $layoutTab)
+                case .titles: titleInspector
                 }
             case .motion:
                 Picker("运镜设置", selection: $motionTab) {
@@ -423,7 +459,9 @@ struct TakeEditorView: View {
                 case .click: clickInspector
                 }
             case .audio: audioInspector
-            case .captions: SubtitleInspector(editor: editor, showingTranscriptionTools: $showingTranscriptionTools)
+            case .captions:
+                SubtitleInspector(editor: editor, showingTranscriptionTools: $showingTranscriptionTools,
+                                  showProofreading: { showingProofreading = true })
             }
         }
         .controlSize(.small)
@@ -434,6 +472,48 @@ struct TakeEditorView: View {
         pickingFocus = false
         inspectorVisible = true
         inspectorTab = .captions
+    }
+
+    private func showTitles() {
+        pickingFocus = false
+        inspectorVisible = true
+        inspectorTab = .picture
+        pictureTab = .titles
+    }
+
+    private var titleInspector: some View {
+        let appearance = Binding(
+            get: { editor.manifest.titleAppearance ?? TitleAppearance() },
+            set: { editor.manifest.titleAppearance = $0 }
+        )
+        return VStack(alignment: .leading, spacing: 8) {
+            Button("在播放头添加花字") { editor.addTitle() }
+                .disabled(editor.manifest.timelineDuration < SubtitleCue.minimumDuration)
+            if let selected = editor.selectedTitle {
+                TextEditor(text: Binding(
+                    get: { editor.selectedTitle?.text ?? selected.text },
+                    set: { text in
+                        guard var current = editor.selectedTitle, current.id == selected.id else { return }
+                        current.text = String(text.prefix(180))
+                        editor.updateTitle(current, record: false)
+                    }
+                ))
+                .font(.body).frame(height: 56)
+                .overlay { RoundedRectangle(cornerRadius: 4).strokeBorder(WorkbenchStyle.line).allowsHitTesting(false) }
+                .accessibilityLabel("花字内容")
+                Text("\(timelineTime(selected.start)) – \(timelineTime(selected.end))")
+                    .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                Button("删除所选花字", role: .destructive) { editor.deleteTitle() }
+            }
+            if !editor.manifest.titleCues.isEmpty {
+                Picker("花字位置", selection: appearance.position) {
+                    ForEach(TitleAppearance.Position.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+                }
+                Picker("花字颜色", selection: appearance.tone) {
+                    ForEach(TitleAppearance.Tone.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+                }
+            }
+        }
     }
 
     private func section<Content: View>(_ title: String, icon: String,
@@ -473,6 +553,12 @@ struct TakeEditorView: View {
         let selection = angles.contains(editor.selectedTrack) ? editor.selectedTrack : angles.first
         return section(angles.count > 1 ? "人像机位" : "人像", icon: "video") {
             if let kind = selection {
+                Toggle("对谈布局", isOn: Binding(get: { editor.canvas.cameraStage == true }, set: { enabled in
+                    var canvas = editor.canvas
+                    canvas.cameraStage = enabled ? true : nil
+                    editor.canvas = canvas
+                }))
+                .help("有机位画面时铺满画布。横屏左右并排，竖屏上下排列。")
                 if angles.count > 1 {
                     Picker("机位", selection: Binding(get: { kind }, set: editor.selectTrack)) {
                         ForEach(angles) { Text(editor.manifest.trackDescription($0)).tag($0) }
@@ -489,11 +575,19 @@ struct TakeEditorView: View {
                         get: { clip.hidden != true }, set: { editor.setCameraClipVisible(clip, $0) }
                     ))
                     .disabled(!editor.manifest.edit(kind).enabled)
+                    Toggle("所选片段人像全屏", isOn: Binding(
+                        get: { clip.fullFrame == true }, set: { editor.setCameraFullFrame(clip, $0) }
+                    ))
+                    .disabled(!editor.manifest.edit(kind).enabled || clip.hidden == true)
+                    .help("在这段人像片段内按当前画幅铺满画布。")
                 }
                 Toggle(angles.count > 1 ? "镜像此机位" : "镜像人像", isOn: Binding(
                     get: { editor.manifest.cameraMirrored(kind) }, set: { editor.setCameraMirror(kind, $0) }
                 ))
-                if editor.canvas.framing == .portrait {
+                if editor.canvas.cameraStage == true {
+                    Text("显示多个机位时分屏，切到单个机位时铺满画布。")
+                        .font(.caption).foregroundStyle(.secondary)
+                } else if editor.canvas.framing == .portrait {
                     Button("调整竖屏人像布局…") {
                         layoutTab = .camera
                         pictureTab = .layout
@@ -546,7 +640,8 @@ struct TakeEditorView: View {
 
     private func trim(_ clip: TimelineClip, left: Bool) {
         editor.editClip(ClipEdit.trimmed(clip, left: left, to: editor.playhead,
-                                         among: editor.manifest.timelineClips, playhead: editor.playhead, snap: 0))
+                                         among: editor.manifest.timelineClips, playhead: editor.playhead, snap: 0),
+                        closingTrimGap: autoCloseGaps)
     }
 
     private var motionInspector: some View {

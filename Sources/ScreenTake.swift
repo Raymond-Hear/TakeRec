@@ -6,7 +6,7 @@ import Foundation
 import os
 
 private let screenPreviewLimit: CGFloat = 1920
-private let screenLog = Logger(subsystem: "local.takerec.community", category: "ScreenCapture")
+private let screenLog = Logger(subsystem: "local.lingfeng.DeskTake", category: "ScreenCapture")
 
 private final class ScreenSamples: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
     let queue = DispatchQueue(label: "local.desktake.screen", qos: .userInitiated)
@@ -355,10 +355,15 @@ final class ScreenSource {
 
 @MainActor
 final class ScreenTake {
+    enum Input {
+        case screen(ScreenSource)
+        case movie(MovieDemoSource, includesAudio: Bool)
+    }
+
     private let options: CaptureOptions
-    private let size: CaptureSize
     private let writer: MovieWriter
-    private let source: ScreenSource
+    private let screen: (source: ScreenSource, size: CaptureSize)?
+    private let movie: MovieDemoSource?
     private let cameras: [TrackKind: DeviceInput]
     private let microphone: DeviceInput?
     #if !TAKEREC_STORE
@@ -375,28 +380,42 @@ final class ScreenTake {
     private let onCameraStopped: @MainActor (TrackKind) -> Void
     private var acceptsPointer = false
 
-    init(source: ScreenSource, options: CaptureOptions, onStarted: @escaping @MainActor (Double) -> Void,
+    init(input: Input, options: CaptureOptions, onStarted: @escaping @MainActor (Double) -> Void,
          onInterruption: @escaping @Sendable (Error) -> Void, onLevel: @escaping @Sendable (Double) -> Void,
          onCameraStopped: @escaping @MainActor (TrackKind) -> Void, onMaskState: @escaping @Sendable (FaceMaskState) -> Void,
          coversLocation: @escaping (CGPoint) -> Bool,
+         onCameraPreview: (@Sendable (TrackKind, CGImage) -> Void)? = nil,
          recordingToolKeys: @escaping () -> [ShortcutKey] = { [] },
          onKeyPress: @escaping ([String]) -> Void = { _ in }) throws {
         self.options = options
-        self.source = source
-        size = try source.size(for: options.screenResolution)
+        let primary: MovieWriter.Primary
+        switch input {
+        case .screen(let source):
+            let size = try source.size(for: options.screenResolution)
+            screen = (source, size)
+            movie = nil
+            primary = .screen(size)
+        case .movie(let demo, let includesAudio):
+            screen = nil
+            movie = demo
+            primary = .movie(title: demo.title, range: demo.videoRange, includesAudio: includesAudio)
+        }
         self.onStarted = onStarted
         self.onInterruption = onInterruption
         self.onLevel = onLevel
         self.onCameraStopped = onCameraStopped
-        folder = try TakeProject.temporaryFolder()
+        folder = try movie?.folder ?? TakeProject.temporaryFolder()
         do {
-            let writer = try MovieWriter(folder: folder, size: size, options: options, queue: source.queue)
+            let writer = try MovieWriter(folder: folder, primary: primary, options: options,
+                                         queue: screen?.source.queue, onCameraPreview: movie == nil ? nil : onCameraPreview)
             self.writer = writer
-            pointer = options.recordClickEffects || options.cursorAppearance == .editable
-                ? PointerCapture(filter: source.filter, size: size, recordsClicks: options.recordClickEffects,
-                                 croppedTop: source.croppedTop,
+            if let screen, options.recordClickEffects || options.cursorAppearance == .editable {
+                pointer = PointerCapture(filter: screen.source.filter, size: screen.size, recordsClicks: options.recordClickEffects,
+                                 croppedTop: screen.source.croppedTop,
                                  coversLocation: coversLocation)
-                : nil
+            } else {
+                pointer = nil
+            }
             keyboard = options.keyboard.map {
                 KeyPressCapture(options: $0, excludedShortcuts: recordingToolKeys, onPress: onKeyPress)
             }
@@ -446,12 +465,14 @@ final class ScreenTake {
                     throw RecorderError.message("\(name)未能启动。\(error.localizedDescription)")
                 }
             }
-            let streamCapturesMicrophone = try await source.startRecording(writer, size: size, options: options)
+            let streamCapturesMicrophone = if let screen {
+                try await screen.source.startRecording(writer, size: screen.size, options: options)
+            } else { false }
             if !streamCapturesMicrophone, let microphone, let id = options.microphoneID {
                 try await microphone.select(id)
             }
             acceptsPointer = true
-            writer.begin(clock: source.clock, onStarted: { [weak self] hostTime in
+            writer.begin(clock: screen?.source.clock, onStarted: { [weak self] hostTime in
                 Task { @MainActor in
                     guard let self, self.acceptsPointer else { return }
                     self.pointer?.start(at: hostTime)
@@ -474,7 +495,7 @@ final class ScreenTake {
             #if !TAKEREC_STORE
             phone?.setOutputs(video: nil, audio: nil)
             #endif
-            await source.stop()
+            await screen?.source.stop()
             await stopDevices()
             try? FileManager.default.removeItem(at: folder)
             throw error
@@ -534,14 +555,16 @@ final class ScreenTake {
     var keyboardRecordingNotice: String? { keyboardIssue?.recordingNotice ?? keyboard?.recordingNotice }
 
     func stop() async throws -> RecordedMedia {
+        let stopTime = CMClockGetTime(CMClockGetHostTimeClock())
+        movie?.stopPlayback()
         acceptsPointer = false
         #if !TAKEREC_STORE
         phone?.setOutputs(video: nil, audio: nil)
         #endif
         let trace = pointer?.stop() ?? PointerTrace()
         let keys = keyboard?.stop()
-        async let draft = writer.finish()
-        await source.stop()
+        async let draft = writer.finish(at: stopTime)
+        await screen?.source.stop()
         await stopDevices()
         do {
             var media = try await draft
@@ -554,6 +577,7 @@ final class ScreenTake {
             media.prioritizeNarration = options.prioritizeNarration
             media.portraitLighting = options.portraitLighting
             media.microphoneGain = options.microphoneGain
+            movie?.preserveFiles()
             return media
         } catch {
             try? FileManager.default.removeItem(at: folder)

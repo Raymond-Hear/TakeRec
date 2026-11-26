@@ -65,14 +65,23 @@ private final class TrackWriter: @unchecked Sendable {
 
 /// Capture callbacks, frame timing, and track writers share one serial queue.
 final class MovieWriter: @unchecked Sendable {
+    enum Primary {
+        case screen(CaptureSize)
+        case movie(title: String, range: CMTimeRange, includesAudio: Bool)
+    }
+
     let queue: DispatchQueue
 
     private let folder: URL
+    private let primary: Primary
     private let expected: [TrackKind]
     private let cameraResolutions: [TrackKind: VideoResolution]
     private let cameraNames: [TrackKind: String]
     private let cameraTracks: [TrackKind]
     private let meterSource: TrackKind?
+    private let onCameraPreview: (@Sendable (TrackKind, CGImage) -> Void)?
+    private let cameraPreviews: [TrackKind: PreviewImageDecoder]
+    private let portraitLighting: PortraitLighting
     private var tracks: [TrackKind: TrackWriter] = [:]
     private let context = CIContext(options: [.cacheIntermediates: false])
     private let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
@@ -90,10 +99,12 @@ final class MovieWriter: @unchecked Sendable {
     private var lastMeterUpdate: ContinuousClock.Instant?
     private var onLevel: (@Sendable (Double) -> Void)?
 
-    init(folder: URL, size: CaptureSize, options: CaptureOptions,
-         queue: DispatchQueue = DispatchQueue(label: "local.desktake.samples", qos: .userInitiated)) throws {
+    init(folder: URL, primary: Primary, options: CaptureOptions,
+         queue: DispatchQueue? = nil,
+         onCameraPreview: (@Sendable (TrackKind, CGImage) -> Void)? = nil) throws {
         self.folder = folder
-        self.queue = queue
+        self.primary = primary
+        self.queue = queue ?? DispatchQueue(label: "local.desktake.samples", qos: .userInitiated)
         let selected = options.cameras
         guard !selected.values.contains(""), Set(selected.values).count == selected.count else {
             throw RecorderError.message("请为每个机位选择不同的摄像头。")
@@ -101,13 +112,22 @@ final class MovieWriter: @unchecked Sendable {
         cameraTracks = TrackKind.cameraTracks.filter { selected[$0] != nil }
         cameraResolutions = Dictionary(uniqueKeysWithValues: cameraTracks.map { ($0, options.resolution(for: $0)) })
         cameraNames = options.cameraNames
+        self.onCameraPreview = onCameraPreview
+        cameraPreviews = onCameraPreview == nil ? [:] : Dictionary(uniqueKeysWithValues: cameraTracks.map {
+            ($0, PreviewImageDecoder(limit: 360))
+        })
+        portraitLighting = options.portraitLighting ?? PortraitLighting()
         var expected: [TrackKind] = [.screen] + cameraTracks
-        if options.systemAudio { expected.append(.system) }
+        if case .screen(let size) = primary {
+            tracks[.screen] = try TrackWriter(kind: .screen, folder: folder, size: size)
+            if options.systemAudio { expected.append(.system) }
+        } else if case .movie(_, _, true) = primary {
+            expected.append(.originalAudio)
+        }
         if options.microphone { expected.append(.microphone) }
         self.expected = expected
-        meterSource = options.microphone ? .microphone : (options.systemAudio ? .system : nil)
-        tracks[.screen] = try TrackWriter(kind: .screen, folder: folder, size: size)
-        for kind in expected where !kind.isVideo {
+        meterSource = options.microphone ? .microphone : (expected.contains(.system) ? .system : nil)
+        for kind in expected where !kind.isVideo && kind != .originalAudio {
             tracks[kind] = try TrackWriter(kind: kind, folder: folder)
         }
     }
@@ -122,6 +142,9 @@ final class MovieWriter: @unchecked Sendable {
         dispatchPrecondition(condition: .onQueue(queue))
         guard cameraResolutions[source] != nil, !stoppedCameras.contains(source) else { return }
         cameras[source] = (buffer, .now)
+        if let onCameraPreview, let preview = cameraPreviews[source]?.frame(buffer, lighting: portraitLighting) {
+            onCameraPreview(source, preview)
+        }
     }
 
     func setPaused(_ paused: Bool, at hostTime: CMTime) {
@@ -212,7 +235,8 @@ final class MovieWriter: @unchecked Sendable {
                     if try self.writeFrame(onCameraStopped: onCameraStopped) { onStarted(self.hostStart) }
                     if self.lastFrameIndex < 0, waiting.duration(to: .now) > .seconds(8) {
                         let kind = self.cameraTracks.first { self.liveCamera($0) == nil }
-                        let missing = self.screen == nil ? "屏幕" : kind.map { self.cameraNames[$0] ?? $0.angleTitle } ?? "录制"
+                        let missing = self.tracks[.screen] != nil && self.screen == nil
+                            ? "屏幕" : kind.map { self.cameraNames[$0] ?? $0.angleTitle } ?? "录制"
                         throw RecorderError.message("未收到\(missing)画面，请检查来源。")
                     }
                     if self.lastFrameIndex >= 0 {
@@ -248,8 +272,8 @@ final class MovieWriter: @unchecked Sendable {
     }
 
     private func writeFrame(onCameraStopped: (TrackKind) -> Void) throws -> Bool {
-        guard let screen, let screenTrack = tracks[.screen],
-              pauses.pausedAt == nil else { return false }
+        let screenTrack = tracks[.screen]
+        guard (screenTrack == nil || screen != nil), pauses.pausedAt == nil else { return false }
         if startTime == nil {
             let ready = cameraTracks.compactMap { kind in liveCamera(kind).map { (kind, $0) } }
             guard ready.count == cameraTracks.count else { return false }
@@ -265,14 +289,14 @@ final class MovieWriter: @unchecked Sendable {
             startTime = time
         }
         guard let startTime, let now = pauses.adjusted(CMClockGetTime(clock)),
-              screenTrack.input.isReadyForMoreMediaData else { return false }
+              screenTrack?.input.isReadyForMoreMediaData != false else { return false }
         let elapsed = now - startTime
         let index = lastFrameIndex < 0 ? 0 : CMTimeConvertScale(elapsed, timescale: CaptureSize.framesPerSecond,
                                                                method: .roundTowardZero).value
         guard index > lastFrameIndex else { return false }
 
         let time = startTime + CMTime(value: index, timescale: CaptureSize.framesPerSecond)
-        try append(screen, to: screenTrack, at: time)
+        if let screenTrack, let screen { try append(screen, to: screenTrack, at: time) }
         for kind in cameraTracks {
             guard let camera = liveCamera(kind), let track = tracks[kind], track.input.isReadyForMoreMediaData else { continue }
             do { try append(camera, to: track, at: time) }
@@ -306,7 +330,7 @@ final class MovieWriter: @unchecked Sendable {
         track.hasSamples = true
     }
 
-    func finish() async throws -> RecordedMedia {
+    func finish(at hostTime: CMTime = CMClockGetTime(CMClockGetHostTimeClock())) async throws -> RecordedMedia {
         try await withCheckedThrowingContinuation { continuation in
             queue.async {
                 self.timer?.cancel()
@@ -325,21 +349,38 @@ final class MovieWriter: @unchecked Sendable {
                     }
                 }
                 group.notify(queue: self.queue) {
-                    let available = self.expected.filter { tracks[$0]?.writer.status == .completed }
+                    var movie: (title: String, duration: Double)?
+                    var movieStart = 0.0
+                    if case .movie(let title, let range, _) = self.primary, let start = self.startTime {
+                        let end = CMSyncConvertTime(hostTime, from: CMClockGetHostTimeClock(), to: self.clock)
+                        let duration = min(range.duration.seconds, self.pauses.elapsed(since: start, at: end))
+                        if duration >= 0.05 {
+                            movie = (title, duration)
+                            movieStart = range.start.seconds
+                        }
+                    }
+                    let available = self.expected.filter { kind in
+                        if movie != nil, kind == .screen || kind == .originalAudio { return true }
+                        return tracks[kind]?.writer.status == .completed
+                    }
                     guard available.first == .screen else {
                         let error = self.failure ?? tracks[.screen]?.writer.error
-                            ?? RecorderError.message("没有录到可保存的屏幕画面。")
+                            ?? RecorderError.message("没有录到可保存的画面，请录制至少一秒后再停止。")
                         continuation.resume(throwing: error)
                         return
                     }
                     let missing = self.expected.filter { !available.contains($0) }
-                    let offsets = Dictionary(uniqueKeysWithValues: available.compactMap { kind -> (TrackKind, Double)? in
+                    var offsets = Dictionary(uniqueKeysWithValues: available.compactMap { kind -> (TrackKind, Double)? in
                         guard let track = tracks[kind], track.sourceOffset > 0 else { return nil }
                         return (kind, track.sourceOffset)
                     })
+                    if movieStart > 0 {
+                        offsets[.screen] = -movieStart
+                        if available.contains(.originalAudio) { offsets[.originalAudio] = -movieStart }
+                    }
                     continuation.resume(returning: RecordedMedia(folder: self.folder, tracks: available, missing: missing,
                         sourceOffsets: offsets, interruptedCameras: self.cameraTracks.filter(self.stoppedCameras.contains),
-                        cameraNames: self.cameraNames))
+                        cameraNames: self.cameraNames, movie: movie))
                 }
             }
         }

@@ -20,11 +20,11 @@ struct RecorderView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            header
+            header.disabled(model.firstTakeInProgress)
             HStack(spacing: 0) {
                 previewPanel.frame(maxWidth: .infinity, maxHeight: .infinity)
                 Rectangle().fill(WorkbenchStyle.line).frame(width: 1)
-                inputPanel.frame(width: 270)
+                inputPanel.frame(width: 270).disabled(model.firstTakeInProgress)
             }
             .workbenchPanel()
             if model.phase == .idle { inputPrivacy }
@@ -62,6 +62,7 @@ struct RecorderView: View {
         .frame(minWidth: 735, idealWidth: 940, minHeight: 580)
         .background(WorkbenchStyle.workspace)
         .tint(WorkbenchStyle.accent)
+        .firstTakeSpotlight(firstTakeTarget, note: model.notice ?? (model.overlayActive ? "请先关闭系统人物前置，再选窗口。" : nil))
         .onAppear { model.showSetup() }
         .onDisappear { model.hideSetup() }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
@@ -84,7 +85,7 @@ struct RecorderView: View {
         } message: {
             Text(model.recordingPanelAvailability?.notice ?? "")
         }
-        .sheet(isPresented: $permissions.isPresented) {
+        .sheet(isPresented: $permissions.isPresented, onDismiss: model.permissionsSheetDidDismiss) {
             RecordingPermissionGuide(permissions: permissions, canRestart: model.canRestartForPermissions,
                                      restart: model.restartForPermissions, request: model.requestPermission,
                                      recheck: model.recheckPermissions, finish: model.finishPermissions)
@@ -100,6 +101,16 @@ struct RecorderView: View {
                              renew: model.startPhonePairing, disconnect: model.disconnectPhone)
         }
         #endif
+    }
+
+    private var firstTakeTarget: FirstTakeTarget? {
+        switch model.firstTakeStep {
+        case .prepare where model.phase == .idle && !permissions.isPresented:
+            model.canRecord ? .start : .chooseSource
+        case .recording where model.phase == .recording && !model.controlsVisible:
+            .stop
+        default: nil
+        }
     }
 
     private var deviceSelection: [String] {
@@ -218,7 +229,9 @@ struct RecorderView: View {
                 } else {
                     WorkbenchStyle.canvas
                 }
-                if model.phase == .recording {
+                if let demo = model.movieDemo {
+                    moviePreview(demo, in: geometry.size)
+                } else if model.phase == .recording {
                     recordingBadge
                 } else if let screen = model.screenFrame {
                     let available = CGSize(width: max(0, geometry.size.width - 16),
@@ -256,8 +269,21 @@ struct RecorderView: View {
         .accessibilityLabel("录制内容预览")
     }
 
+    private func moviePreview(_ demo: MovieDemoSource, in available: CGSize) -> some View {
+        let size = PreviewGeometry.fit(demo.videoSize, in: CGSize(width: max(0, available.width - 16),
+                                                                height: max(0, available.height - 20)))
+        let edge = min(size.width, size.height)
+        return PlayerSurface(player: demo.player)
+            .frame(width: size.width, height: size.height)
+            .clipShape(RoundedRectangle(cornerRadius: 5))
+            .allowsHitTesting(false)
+            .overlay(alignment: .bottomTrailing) {
+                if model.useCamera { cameraPreviews(side: edge * 0.24).padding(edge * 0.032) }
+            }
+    }
+
     private func cameraPreviews(side: CGFloat) -> some View {
-        let angles = TrackKind.cameraTracks.filter { model.activeCameraIDs[$0] != nil }
+        let angles = TrackKind.cameraTracks.filter { model.activeCameraIDs[$0] != nil && !model.stoppedCameras.contains($0) }
         return HStack(alignment: .top, spacing: 6) {
             ForEach(angles) { kind in
                 VStack(spacing: 3) {
@@ -309,7 +335,9 @@ struct RecorderView: View {
             if !model.controlsVisible {
                 HStack {
                     Button(model.isPaused ? "继续" : "暂停") { model.togglePause() }
+                        .disabled(model.firstTakeInProgress)
                     Button("结束录制") { model.stop() }
+                        .firstTakeTarget(.stop)
                 }
                 .environment(\.colorScheme, .dark)
             }
@@ -323,8 +351,18 @@ struct RecorderView: View {
             }
             .labelsHidden().pickerStyle(.segmented)
             .frame(width: 136)
-            Button(model.sourceName == nil ? "选择录制内容…" : "更换来源…") { model.chooseSource() }
+            .disabled(model.firstTakeInProgress)
+            Button(model.movieDemo != nil ? "改录屏幕…" : model.sourceName == nil ? "选择录制内容…" : "更换来源…") {
+                model.chooseSource()
+            }
                 .fixedSize()
+                .disabled(model.firstTakeInProgress && firstTakeTarget != .chooseSource)
+                .firstTakeTarget(.chooseSource)
+            if !model.firstTakeInProgress {
+                Button { model.chooseMovieDemo() } label: { Label("演示 MP4…", systemImage: "film") }
+                    .fixedSize()
+                    .help("播放本机 MP4，同时录制选中的摄像头和麦克风。")
+            }
             Spacer(minLength: 4)
             if let name = model.sourceName {
                 Label(name, systemImage: "checkmark.circle")
@@ -332,14 +370,25 @@ struct RecorderView: View {
                 Button {
                     model.clearSource()
                 } label: { Image(systemName: "xmark.circle") }
-                .buttonStyle(.plain).help("关闭屏幕预览")
-                .accessibilityLabel("关闭屏幕预览")
+                .buttonStyle(.plain).help("清除当前来源")
+                .accessibilityLabel("清除当前来源")
+                .disabled(model.firstTakeInProgress)
             }
         }
         .disabled(model.phase != .idle)
     }
 
-    private var screenQuality: some View {
+    @ViewBuilder private var screenQuality: some View {
+        if let demo = model.movieDemo {
+            Label("原片 \(Int(demo.videoSize.width.rounded())) × \(Int(demo.videoSize.height.rounded())) px · 播放完自动结束录制",
+                  systemImage: "film")
+                .font(.caption).foregroundStyle(.secondary).monospacedDigit()
+        } else {
+            screenResolutionControls
+        }
+    }
+
+    private var screenResolutionControls: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 9) {
                 Text("屏幕分辨率").font(.callout.weight(.medium))
@@ -366,7 +415,7 @@ struct RecorderView: View {
         }
         .font(.caption)
         .foregroundStyle(.secondary)
-        .disabled(model.phase != .idle)
+        .disabled(model.phase != .idle || model.firstTakeInProgress)
     }
 
     private var inputPrivacy: some View {
@@ -535,11 +584,45 @@ struct RecorderView: View {
 
     private var otherInputs: some View {
         VStack(alignment: .leading, spacing: 7) {
-            Toggle("系统声音", isOn: $model.useSystemAudio)
-            if model.useSystemAudio && model.useMicrophone && !model.isContinuing {
+            if let demo = model.movieDemo {
+                if demo.hasAudio {
+                    Toggle("将原声加入时间线", isOn: $model.includeMovieAudio)
+                        .help("录制时播放原声，剪辑时可与麦克风分开调音量。")
+                } else {
+                    Text("此 MP4 没有原声").font(.caption).foregroundStyle(.secondary)
+                }
+            } else {
+                Toggle("系统声音", isOn: $model.useSystemAudio)
+            }
+            let hasBackground = model.movieDemo.map { $0.hasAudio && model.includeMovieAudio } ?? model.useSystemAudio
+            if hasBackground && model.useMicrophone && !model.isContinuing {
                 Toggle("人声优先", isOn: $model.prioritizeNarration)
             }
             Toggle("显示录制控制条", isOn: $model.showRecordingStrip)
+            if model.movieDemo == nil { screenInputOptions }
+            HStack {
+                if model.movieDemo == nil {
+                    Button("录制选项…") { showingCaptureOptions.toggle() }
+                        .popover(isPresented: $showingCaptureOptions) {
+                            VStack(alignment: .leading, spacing: 9) {
+                                Picker("光标", selection: $model.cursorAppearance) {
+                                    ForEach(CursorAppearance.allCases) { Text($0.rawValue).tag($0) }
+                                }
+                                .help("需要录后更换光标时，录制前选「可编辑样式」。")
+                                Toggle("记录点击与运镜", isOn: $model.recordClickEffects)
+                            }
+                            .controlSize(.small)
+                            .padding(14).frame(width: 258)
+                        }
+                }
+                Spacer(minLength: 4)
+                Button("刷新设备") { model.refreshDevices() }
+            }
+        }
+    }
+
+    private var screenInputOptions: some View {
+        VStack(alignment: .leading, spacing: 7) {
             Toggle("保留按键轨", isOn: $model.retainKeystrokes)
             if model.retainKeystrokes {
                 Toggle("录制时显示键帽", isOn: $model.showKeystrokes)
@@ -559,22 +642,6 @@ struct RecorderView: View {
                      : "工程只保留快捷键和操作键。剪辑时可开关按键轨。")
                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }
-            HStack {
-                Button("录制选项…") { showingCaptureOptions.toggle() }
-                    .popover(isPresented: $showingCaptureOptions) {
-                        VStack(alignment: .leading, spacing: 9) {
-                            Picker("光标", selection: $model.cursorAppearance) {
-                                ForEach(CursorAppearance.allCases) { Text($0.rawValue).tag($0) }
-                            }
-                            .help("需要录后更换光标时，录制前选「可编辑样式」。")
-                            Toggle("记录点击与运镜", isOn: $model.recordClickEffects)
-                        }
-                        .controlSize(.small)
-                        .padding(14).frame(width: 258)
-                    }
-                Spacer(minLength: 4)
-                Button("刷新设备") { model.refreshDevices() }
-            }
         }
     }
 
@@ -582,25 +649,43 @@ struct RecorderView: View {
         HStack(spacing: 10) {
             switch model.phase {
             case .idle:
-                if model.isContinuing {
-                    Button("返回当前工程") { model.returnToEditor() }
-                } else {
-                    Button("打开工程 / MP4…") { model.openProject() }
+                Group {
+                    if model.isContinuing {
+                        Button("返回当前工程") { model.returnToEditor() }
+                    } else {
+                        Button("打开工程 / MP4…") { model.openProject() }
+                    }
                 }
+                .disabled(model.firstTakeInProgress)
                 Spacer(minLength: 8)
-                if model.canRecord, model.retainKeystrokes, !model.inputMonitoringAllowed {
+                if model.canRecord, model.movieDemo == nil, model.retainKeystrokes, !model.inputMonitoringAllowed {
                     Label("本次不录按键", systemImage: "keyboard").font(.caption).foregroundStyle(.secondary)
                 }
                 Text(shortcutHint).font(.caption).foregroundStyle(.secondary)
                 Button {
                     model.startRecording()
                 } label: {
-                    Label("开始录制", systemImage: "record.circle")
+                    Label(model.movieDemo == nil ? "开始录制" : "播放并录制", systemImage: "record.circle")
                 }
                 .buttonStyle(DeskPrimaryButton(color: WorkbenchStyle.record))
                 .keyboardShortcut(.defaultAction).disabled(!model.canRecord)
+                .firstTakeTarget(.start)
             case .recording:
-                Spacer(minLength: 0)
+                if let demo = model.movieDemo {
+                    TimelineView(.periodic(from: .now, by: 0.2)) { _ in
+                        let elapsed = (demo.player.currentTime() - demo.videoRange.start).seconds
+                        HStack(spacing: 10) {
+                            Text(model.recordingTime).monospacedDigit()
+                            ProgressView(value: elapsed.isFinite ? clamp(elapsed / demo.videoRange.duration.seconds, 0, 1) : 0)
+                                .accessibilityLabel("演示播放进度")
+                        }
+                    }
+                    Button(model.isPaused ? "继续" : "暂停") { model.togglePause() }
+                    Button("结束录制") { model.stop() }
+                        .buttonStyle(DeskPrimaryButton(color: WorkbenchStyle.record))
+                } else {
+                    Spacer(minLength: 0)
+                }
             case .choosing:
                 Text(model.phase.title).font(.callout)
             default:

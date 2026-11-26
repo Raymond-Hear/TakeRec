@@ -4,10 +4,11 @@ import Carbon
 enum ShortcutAction: UInt32, CaseIterable, Identifiable, Codable {
     case start = 1, stop, previousPage, nextPage, togglePrompt
     case playback, save, splitTrack, splitAll, deleteClip, undo
-    case togglePromptScroll, clearKeyDisplay
+    case togglePromptScroll, clearKeyDisplay, pasteMedia
+    case redo = 15
 
     static let recording: [Self] = [.start, .stop, .togglePrompt, .previousPage, .nextPage, .togglePromptScroll, .clearKeyDisplay]
-    static let editing: [Self] = [.playback, .save, .splitTrack, .splitAll, .deleteClip, .undo]
+    static let editing: [Self] = [.playback, .save, .splitTrack, .splitAll, .deleteClip, .undo, .redo, .pasteMedia]
 
     var id: Self { self }
     var isGlobal: Bool { Self.recording.contains(self) }
@@ -28,6 +29,8 @@ enum ShortcutAction: UInt32, CaseIterable, Identifiable, Codable {
         case .splitAll: "分割所有轨道"
         case .deleteClip: "删除所选片段"
         case .undo: "撤销片段操作"
+        case .redo: "重做片段操作"
+        case .pasteMedia: "粘贴 MP4 素材"
         }
     }
 
@@ -47,6 +50,8 @@ enum ShortcutAction: UInt32, CaseIterable, Identifiable, Codable {
         case .splitAll: return ShortcutKey(kVK_ANSI_K, "K", cmdKey | shiftKey)
         case .deleteClip: return ShortcutKey(kVK_Delete, "⌫")
         case .undo: return ShortcutKey(kVK_ANSI_Z, "Z", cmdKey)
+        case .redo: return ShortcutKey(kVK_ANSI_Z, "Z", cmdKey | shiftKey)
+        case .pasteMedia: return ShortcutKey(kVK_ANSI_V, "V", cmdKey)
         }
     }
 }

@@ -109,6 +109,7 @@ struct CanvasInspector: View {
 struct SubtitleInspector: View {
     @ObservedObject var editor: TakeEditorModel
     @Binding var showingTranscriptionTools: Bool
+    let showProofreading: () -> Void
     @State private var showsStyle = false
     private static let fontFamilies = NSFontManager.shared.availableFontFamilies
         .sorted { $0.localizedStandardCompare($1) == .orderedAscending }
@@ -120,6 +121,10 @@ struct SubtitleInspector: View {
                 Button("导入 SRT / TXT…") { editor.importSubtitles() }
                 Button("添加字幕") { editor.addSubtitle() }
             }
+            Button(action: showProofreading) {
+                Label("AI 校对字幕…", systemImage: "sparkles")
+            }
+            .disabled(editor.manifest.subtitleCues.isEmpty)
             Button {
                 showingTranscriptionTools.toggle()
             } label: {
@@ -256,8 +261,11 @@ struct SubtitleInspector: View {
                 timingField("起始秒", cue: cue, start: true)
                 timingField("结束秒", cue: cue, start: false)
                 Button(role: .destructive) { editor.deleteSubtitle() } label: { Image(systemName: "trash") }
-                    .help("删除所选字幕").accessibilityLabel("删除所选字幕")
+                    .help("仅删除这条字幕").accessibilityLabel("仅删除这条字幕")
             }
+            Button("剪掉这句对应的时段") { editor.deleteSelection(closeGap: true) }
+                .disabled(cue.start >= editor.manifest.timelineDuration)
+                .help("各轨剪掉这句对应的时段，后面的内容一起前移")
         }
     }
 

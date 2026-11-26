@@ -42,6 +42,7 @@ final class RecorderModel: NSObject, ObservableObject, SCContentSharingPickerObs
     @Published private(set) var cameras: [CameraSource] = []
     @Published private(set) var microphones: [MicrophoneSource] = []
     @Published private(set) var sourceName: String?
+    @Published private(set) var movieDemo: MovieDemoSource?
     @Published private(set) var screenFrame: CGImage?
     @Published private(set) var cameraFrame: CGImage?
     @Published private(set) var additionalCameraFrames: [TrackKind: CGImage] = [:]
@@ -51,12 +52,14 @@ final class RecorderModel: NSObject, ObservableObject, SCContentSharingPickerObs
     @Published private(set) var overlayActive = false
     @Published private(set) var liveKeyLabels: [String] = []
     @Published private(set) var isCapturingKeys = false
+    @Published private(set) var firstTakeStep: FirstTakeStep?
     @Published var showFullScreenToolsChoice = false
 
     @Published var target = CaptureTarget.window
     @Published var useMicrophone = false
     @Published var microphoneGain = 1.0
     @Published var useSystemAudio = false
+    @Published var includeMovieAudio = true
     @Published var useCamera = false
     @Published var cursorAppearance = CursorAppearance.system
     @Published var recordClickEffects = true
@@ -123,8 +126,10 @@ final class RecorderModel: NSObject, ObservableObject, SCContentSharingPickerObs
     private var deviceGeneration = 0
     private var cameraTests: [TrackKind: DeviceInput] = [:]
     private var micTest: DeviceInput?
+    private var firstTakeEditorObservers: [AnyCancellable] = []
     private var setupVisible = false
     private static let permissionSetupKey = "TakeRec.Permissions.RecordingSetup"
+    private static let firstTakeKey = "TakeRec.FirstTakeTutorial"
 
     private struct PermissionSetup: Codable {
         let target: CaptureTarget
@@ -143,6 +148,18 @@ final class RecorderModel: NSObject, ObservableObject, SCContentSharingPickerObs
     override init() {
         super.init()
         restoreSetupForPermissions()
+        let tutorial = UserDefaults.standard.string(forKey: Self.firstTakeKey)
+        if tutorial == "active" || (tutorial == nil && !permissions.hasSeenGuide) {
+            target = .window
+            UserDefaults.standard.set("active", forKey: Self.firstTakeKey)
+            if !permissions.beginOnboarding() {
+                firstTakeStep = .prepare
+                UserDefaults.standard.removeObject(forKey: Self.permissionSetupKey)
+            }
+        } else if tutorial == "replay" {
+            firstTakeStep = .prepare
+            target = .window
+        }
         #if !TAKEREC_STORE
         phoneChanges = phone.objectWillChange.sink { [weak self] in self?.objectWillChange.send() }
         #endif
@@ -151,8 +168,10 @@ final class RecorderModel: NSObject, ObservableObject, SCContentSharingPickerObs
     }
 
     var canRecord: Bool {
-        guard setupVisible && phase == .idle && !permissions.isPresented && source != nil && screenFrame != nil && !overlayActive &&
-            activeCameraIDs.keys.allSatisfy({ frame(for: $0) != nil }) &&
+        let hasScreen = source != nil && screenFrame != nil && !overlayActive
+        guard setupVisible, phase == .idle, !permissions.blocksRecording, hasScreen || movieDemo != nil else { return false }
+        if firstTakeStep == .prepare { return hasScreen && !isFullScreenSource }
+        guard activeCameraIDs.keys.allSatisfy({ frame(for: $0) != nil }) &&
             (!useMicrophone || !microphoneLevels.isEmpty) else { return false }
         #if !TAKEREC_STORE
         if phoneCameraSelected && !phone.hasVideo { return false }
@@ -302,7 +321,9 @@ final class RecorderModel: NSObject, ObservableObject, SCContentSharingPickerObs
 
     var recordingPanelAvailability: RecordingPanelAvailability? { source?.panelAvailability }
     var isFullScreenSource: Bool { source?.filter.style == .display }
-    var canShowRecordingPanels: Bool { phase == .recording && source?.protectsRecordingPanels == true }
+    var canShowRecordingPanels: Bool {
+        phase == .recording && (source?.protectsRecordingPanels == true || movieDemo != nil)
+    }
 
     var recordingTime: String {
         guard let startedAt else { return "00:00" }
@@ -312,6 +333,7 @@ final class RecorderModel: NSObject, ObservableObject, SCContentSharingPickerObs
     }
 
     var cameraStatus: String {
+        if firstTakeStep == .recording { return "单窗口练习" }
         if let stopped = TrackKind.cameraTracks.first(where: stoppedCameras.contains) {
             return activeCameraIDs.count > 1 ? "\(stopped.angleTitle)已停止录制" : "摄像头已停止录制"
         }
@@ -323,13 +345,17 @@ final class RecorderModel: NSObject, ObservableObject, SCContentSharingPickerObs
     var cameraStopped: Bool { !stoppedCameras.isEmpty }
 
     var audioMeterTitle: String {
+        if firstTakeStep == .recording { return "仅录画面" }
         if useMicrophone { return "麦克风" }
+        if movieDemo != nil { return "未录麦克风" }
         return useSystemAudio ? "系统声音" : "音频未开启"
     }
 
     var visibleKeyLabels: [String] {
         isPaused || lastKeyAt.duration(to: .now) >= .seconds(1.6) ? [] : liveKeyLabels
     }
+
+    var showsLiveKeys: Bool { movieDemo == nil && !firstTakeInProgress && retainKeystrokes && showKeystrokes }
 
     var keyboardWaitingDescription: String {
         keyboardCaptureIssue?.recordingNotice ?? (isPaused ? "录制已暂停" : take?.keyboardWaitingDescription ?? "按键采集尚未开始")
@@ -343,7 +369,8 @@ final class RecorderModel: NSObject, ObservableObject, SCContentSharingPickerObs
     }
 
     var audioWarning: String? {
-        guard phase == .recording, !isPaused, useMicrophone || useSystemAudio else { return nil }
+        guard phase == .recording, firstTakeStep != .recording, !isPaused,
+              useMicrophone || (movieDemo == nil && useSystemAudio) else { return nil }
         let now = ContinuousClock.now
         if lastAudioAt.duration(to: now) > .seconds(2) { return "未收到音频样本" }
         if recordingLevels.suffix(8).filter({ $0 >= -3 }).count >= 3 { return "电平偏高 · 调低输入音量" }
@@ -352,11 +379,14 @@ final class RecorderModel: NSObject, ObservableObject, SCContentSharingPickerObs
     }
 
     func togglePause() {
-        guard phase == .recording, let take else { return }
+        guard phase == .recording, firstTakeStep != .recording, let take else { return }
         let paused = !isPaused
         let time = CMClockGetTime(CMClockGetHostTimeClock())
         take.setPaused(paused, at: time)
         pauses.setPaused(paused, at: time)
+        if let movieDemo, let startedAt {
+            movieDemo.setPaused(paused, at: time, elapsed: pauses.elapsed(since: startedAt, at: time))
+        }
         if !paused { resetAudioMeter() }
         isPaused = paused
         teleprompter.recordingPaused = paused
@@ -374,7 +404,7 @@ final class RecorderModel: NSObject, ObservableObject, SCContentSharingPickerObs
     }
 
     func showPrompt(recenter: Bool = false) {
-        guard (phase == .idle && setupVisible) || canShowRecordingPanels,
+        guard !firstTakeInProgress, (phase == .idle && setupVisible) || canShowRecordingPanels,
               !teleprompter.pages.isEmpty else { return }
         promptVisible = panels.showPrompt(teleprompter, displayID: source?.panelDisplayID, recenter: recenter) { [weak self] in
             self?.hidePrompt()
@@ -411,9 +441,21 @@ final class RecorderModel: NSObject, ObservableObject, SCContentSharingPickerObs
 
     var inputMonitoringAllowed: Bool { permissions.granted.contains(.keyboard) }
     var canRestartForPermissions: Bool { phase == .idle && editor == nil }
+    var firstTakeInProgress: Bool { firstTakeStep != nil && firstTakeStep != .complete }
+
+    func beginFirstTakeTutorial() {
+        guard canRestartForPermissions, !permissions.isOnboarding, !permissions.busy, !firstTakeInProgress else { return }
+        firstTakeStep = .prepare
+        target = .window
+        UserDefaults.standard.set("replay", forKey: Self.firstTakeKey)
+        hidePrompt()
+        if permissions.isPresented { finishPermissions() }
+        if source != nil || movieDemo != nil { clearSource() }
+        Task { await releaseDeviceTests() }
+    }
 
     func openPermissions(_ permission: RecordingPermission? = nil) {
-        guard phase == .idle else { return }
+        guard phase == .idle, !permissions.isOnboarding, !firstTakeInProgress else { return }
         hidePrompt()
         permissions.open(focusing: permission)
         saveSetupForPermissions()
@@ -425,7 +467,13 @@ final class RecorderModel: NSObject, ObservableObject, SCContentSharingPickerObs
     }
 
     func finishPermissions() {
+        let wasOnboarding = permissions.isOnboarding
         permissions.finish()
+        guard !permissions.blocksRecording else { return }
+        if wasOnboarding {
+            firstTakeStep = .prepare
+            target = .window
+        }
         UserDefaults.standard.removeObject(forKey: Self.permissionSetupKey)
         refreshPermissions()
         updateDeviceTests()
@@ -444,10 +492,33 @@ final class RecorderModel: NSObject, ObservableObject, SCContentSharingPickerObs
     func restartForPermissions() {
         guard canRestartForPermissions, permissions.beginReopen() else { return }
         saveSetupForPermissions()
+        permissions.isPresented = false
+    }
+
+    func permissionsSheetDidDismiss() {
+        guard permissions.reopening else { return }
         Task {
+            let deadline = ContinuousClock.now.advanced(by: .seconds(3))
+            while NSApp.modalWindow != nil || NSApp.windows.contains(where: { $0.attachedSheet != nil }) {
+                guard ContinuousClock.now < deadline else {
+                    permissions.failedToReopen()
+                    return
+                }
+                try? await Task.sleep(for: .milliseconds(50))
+            }
+            guard canRestartForPermissions else {
+                permissions.failedToReopen()
+                return
+            }
             do {
-                try await RecordingPermissions.launchReplacement(at: Bundle.main.bundleURL)
+                let helper = Process()
+                helper.executableURL = Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/TakeRecRelaunch")
+                helper.arguments = [String(ProcessInfo.processInfo.processIdentifier)]
+                try helper.run()
                 NSApp.terminate(nil)
+                // AppKit returns here only if it canceled termination.
+                if helper.isRunning { helper.terminate() }
+                permissions.failedToReopen()
             } catch {
                 permissions.failedToReopen()
             }
@@ -518,7 +589,7 @@ final class RecorderModel: NSObject, ObservableObject, SCContentSharingPickerObs
     }
 
     func continueRecording() {
-        guard phase == .ready, let editor, !editor.isBusy else { return }
+        guard phase == .ready, !firstTakeInProgress, let editor, !editor.isBusy else { return }
         editor.pauseForRecording()
         personShape = editor.manifest.effects.cameraShape
         mirrorCamera = editor.manifest.effects.cameraMirrored
@@ -579,7 +650,8 @@ final class RecorderModel: NSObject, ObservableObject, SCContentSharingPickerObs
     }
 
     func updateDeviceTests() {
-        guard setupVisible, !permissions.isPresented, phase == .idle || phase == .choosing || phase == .connecting else { return }
+        guard setupVisible, !permissions.blocksRecording, !firstTakeInProgress,
+              phase == .idle || phase == .choosing || phase == .connecting else { return }
         deviceGeneration += 1
         let generation = deviceGeneration
         let pending = deviceJob
@@ -717,11 +789,11 @@ final class RecorderModel: NSObject, ObservableObject, SCContentSharingPickerObs
     }
 
     func chooseSource() {
-        guard phase == .idle else { return }
+        guard phase == .idle, !permissions.blocksRecording else { return }
         hidePrompt()
         notice = nil
         phase = .choosing
-        let mode = target
+        let mode = firstTakeStep == .prepare ? .window : target
         Task {
             await releaseSource()
             guard phase == .choosing, setupVisible else { return }
@@ -733,6 +805,51 @@ final class RecorderModel: NSObject, ObservableObject, SCContentSharingPickerObs
             picker.isActive = true
             picker.present(using: mode == .window ? .window : .display)
         }
+    }
+
+    func chooseMovieDemo() {
+        guard phase == .idle, !firstTakeInProgress, !permissions.blocksRecording else { return }
+        hidePrompt()
+        notice = nil
+        let panel = NSOpenPanel()
+        panel.title = "选择要演示的 MP4"
+        panel.prompt = "用作演示"
+        panel.allowedContentTypes = [.mpeg4Movie]
+        panel.canChooseDirectories = false
+        phase = .opening
+        let selection: (NSApplication.ModalResponse) -> Void = { response in
+            guard response == .OK, let url = panel.url else {
+                self.phase = .idle
+                return
+            }
+            Task { await self.selectMovieDemo(url) }
+        }
+        if let window = NSApp.keyWindow, window.attachedSheet == nil {
+            panel.beginSheetModal(for: window, completionHandler: selection)
+        } else {
+            panel.begin(completionHandler: selection)
+        }
+    }
+
+    private func selectMovieDemo(_ url: URL) async {
+        do {
+            let demo = try await MovieDemoSource.load(url)
+            await releaseSource()
+            if setupVisible {
+                movieDemo = demo
+                sourceID = UUID()
+                sourceName = demo.title
+            } else {
+                demo.close()
+            }
+        } catch {
+            notice = "无法打开演示视频。\(error.localizedDescription)"
+        }
+        if !setupVisible {
+            await releaseSource()
+            await releaseDeviceTests()
+        }
+        phase = .idle
     }
 
     nonisolated func contentSharingPicker(_ picker: SCContentSharingPicker, didCancelFor stream: SCStream?) {
@@ -811,6 +928,8 @@ final class RecorderModel: NSObject, ObservableObject, SCContentSharingPickerObs
     private func releaseSource() async {
         let previous = source
         source = nil
+        movieDemo?.close()
+        movieDemo = nil
         sourceID = nil
         sourceName = nil
         screenFrame = nil
@@ -820,11 +939,20 @@ final class RecorderModel: NSObject, ObservableObject, SCContentSharingPickerObs
     }
 
     func startRecording(allowWithoutPanels: Bool = false) {
-        guard canRecord, let source, let id = sourceID else { return }
+        guard canRecord, let id = sourceID else { return }
+        let input: ScreenTake.Input
+        let source = self.source
+        let isMovie = movieDemo != nil
+        if let movieDemo { input = .movie(movieDemo, includesAudio: includeMovieAudio && movieDemo.hasAudio) }
+        else if let source { input = .screen(source) }
+        else { return }
         showFullScreenToolsChoice = false
-        let options = CaptureOptions(cameraID: useCamera ? cameraID : nil,
-                                     microphone: useMicrophone, systemAudio: useSystemAudio,
-                                     cursorAppearance: cursorAppearance, recordClickEffects: recordClickEffects,
+        let guided = firstTakeStep == .prepare
+        let options = guided
+            ? CaptureOptions(cameraID: nil, recordClickEffects: false, screenResolution: screenResolution)
+            : CaptureOptions(cameraID: useCamera ? cameraID : nil,
+                                     microphone: useMicrophone, systemAudio: !isMovie && useSystemAudio,
+                                     cursorAppearance: cursorAppearance, recordClickEffects: !isMovie && recordClickEffects,
                                      microphoneID: useMicrophone ? microphoneID : nil,
                                      personShape: personShape, mirrorCamera: mirrorCamera,
                                      prioritizeNarration: prioritizeNarration, portraitStyle: portraitStyle,
@@ -832,20 +960,20 @@ final class RecorderModel: NSObject, ObservableObject, SCContentSharingPickerObs
                                      cameraResolution: captureCameraResolution,
                                      portraitLighting: useCamera && !portraitStyle.isFaceMask ? currentLighting : nil,
                                      microphoneGain: existingMicrophoneGain ?? microphoneGain,
-                                     keyboard: retainKeystrokes
+                                     keyboard: !isMovie && retainKeystrokes
                                          ? KeyboardCaptureOptions(mode: keyboardMode, corner: keyboardCorner, showInEditorInitially: showKeystrokes)
                                          : nil,
                                      additionalCameras: useCamera ? additionalCameraIDs : [:],
                                      cameraNames: Dictionary(uniqueKeysWithValues: activeCameraIDs.keys.map { ($0, cameraName(for: $0)) }))
-        let wantsPanels = showRecordingStrip || (teleprompter.showOnRecord && !teleprompter.pages.isEmpty)
+        let wantsPanels = guided || showRecordingStrip || (teleprompter.showOnRecord && !teleprompter.pages.isEmpty)
         phase = .starting
         startingHardware = true
         notice = nil
         Task {
             do {
-                source.refreshPanelAvailability()
+                source?.refreshPanelAvailability()
                 if let error = startupInterruption { throw error }
-                if wantsPanels, !allowWithoutPanels, source.panelAvailability != .available {
+                if let source, wantsPanels, !allowWithoutPanels, source.panelAvailability != .available {
                     startingHardware = false
                     phase = .idle
                     showFullScreenToolsChoice = true
@@ -855,7 +983,7 @@ final class RecorderModel: NSObject, ObservableObject, SCContentSharingPickerObs
                 hideRecordingPanels()
                 await releaseDeviceTests()
                 if let error = startupInterruption { throw error }
-                if wantsPanels, isFullScreenSource, source.panelAvailability == .available, !allowWithoutPanels {
+                if let source, wantsPanels, isFullScreenSource, source.panelAvailability == .available, !allowWithoutPanels {
                     let windowIDs = try panels.prepareForDisplayCapture(self, displayID: source.panelDisplayID)
                     try await source.protectRecordingPanels(windowIDs)
                     picker.isActive = false
@@ -865,7 +993,7 @@ final class RecorderModel: NSObject, ObservableObject, SCContentSharingPickerObs
                    !MicrophoneSource.devices().contains(where: { $0.uniqueID == options.microphoneID }) {
                     throw RecorderError.message("所选麦克风已断开。")
                 }
-                let take = try ScreenTake(source: source, options: options, onStarted: { [weak self] hostTime in
+                let take = try ScreenTake(input: input, options: options, onStarted: { [weak self] hostTime in
                     self?.didStart(id: id, hostTime: hostTime)
                 }, onInterruption: { [weak self] error in
                     Task { @MainActor in self?.interrupted(id: id, error: error) }
@@ -881,6 +1009,13 @@ final class RecorderModel: NSObject, ObservableObject, SCContentSharingPickerObs
                     }
                 }, coversLocation: { [weak self] location in
                     self?.panels.coversQuartzPoint(location) ?? false
+                }, onCameraPreview: { [weak self] kind, image in
+                    Task { @MainActor in
+                        guard let self, self.sourceID == id, self.phase == .starting || self.phase == .recording,
+                              !self.stoppedCameras.contains(kind) else { return }
+                        if kind == .camera { self.cameraFrame = image }
+                        else { self.additionalCameraFrames[kind] = image }
+                    }
                 }, recordingToolKeys: { [weak self] in
                     self?.recordingToolKeys ?? []
                 }, onKeyPress: { [weak self] labels in
@@ -892,7 +1027,7 @@ final class RecorderModel: NSObject, ObservableObject, SCContentSharingPickerObs
                 take.setPhoneSource(phone)
                 #endif
                 self.take = take
-                if source.filter.style == .display {
+                if source?.filter.style == .display {
                     panels.parkSetupWindows()
                 }
                 try await take.start()
@@ -921,14 +1056,24 @@ final class RecorderModel: NSObject, ObservableObject, SCContentSharingPickerObs
 
     private func didStart(id: UUID, hostTime: Double) {
         guard sourceID == id, phase == .starting, startupInterruption == nil else { return }
-        startedAt = CMTime(seconds: hostTime, preferredTimescale: 1_000_000_000)
+        let start = CMTime(seconds: hostTime, preferredTimescale: 1_000_000_000)
+        startedAt = start
         resetAudioMeter()
         teleprompter.restart()
         isCapturingKeys = take?.hasKeyboardCapture == true
+        if firstTakeStep == .prepare { firstTakeStep = .recording }
         phase = .recording
-        if showRecordingStrip, canShowRecordingPanels { toggleRecordingStrip() }
+        if let movieDemo {
+            movieDemo.start(at: start, includesAudio: includeMovieAudio && movieDemo.hasAudio, onEnd: { [weak self] in
+                guard let self, self.sourceID == id else { return }
+                self.stop()
+            }, onFailure: { [weak self] error in
+                self?.interrupted(id: id, error: error)
+            })
+        }
+        if showRecordingStrip || firstTakeStep == .recording, canShowRecordingPanels { toggleRecordingStrip() }
         else { panels.hideControls() }
-        if teleprompter.showOnRecord, canShowRecordingPanels { showPrompt() }
+        if firstTakeStep != .recording, teleprompter.showOnRecord, canShowRecordingPanels { showPrompt() }
         else { hidePrompt() }
     }
 
@@ -979,11 +1124,7 @@ final class RecorderModel: NSObject, ObservableObject, SCContentSharingPickerObs
                     }
                     if let keyboardNote = take.keyboardRecordingNotice { notes.append(keyboardNote) }
                     let note = notes.isEmpty ? nil : notes.joined(separator: " ")
-                    if let editor {
-                        try editor.appendRecording(project, note: note)
-                    } else {
-                        editor = TakeEditorModel(project: project, note: note, checkMicrophone: media.tracks.contains(.microphone))
-                    }
+                    try editRecordedTake(project, note: note, checkMicrophone: media.tracks.contains(.microphone))
                 } catch {
                     try? FileManager.default.removeItem(at: media.folder)
                     throw error
@@ -996,10 +1137,32 @@ final class RecorderModel: NSObject, ObservableObject, SCContentSharingPickerObs
             stopPhoneLink()
             await releaseSource()
             resetCapture()
+            if firstTakeStep == .recording { firstTakeStep = .prepare }
             phase = editor == nil ? .idle : .ready
             reveal()
             if phase == .idle { updateDeviceTests() }
         }
+    }
+
+    private func editRecordedTake(_ project: TakeProject, note: String?, checkMicrophone: Bool) throws {
+        if let editor {
+            try editor.appendRecording(project, note: note)
+            return
+        }
+        let editor = TakeEditorModel(project: project, note: note, checkMicrophone: checkMicrophone)
+        self.editor = editor
+        guard firstTakeStep == .recording else { return }
+        firstTakeStep = .review
+        firstTakeEditorObservers = [
+            editor.$playing.filter { $0 }.sink { [weak self] _ in
+                if self?.firstTakeStep == .review { self?.firstTakeStep = .export }
+            },
+            editor.$lastExport.compactMap { $0 }.sink { [weak self] _ in
+                guard let self, self.firstTakeStep == .export else { return }
+                self.firstTakeStep = .complete
+                UserDefaults.standard.set("done", forKey: Self.firstTakeKey)
+            }
+        ]
     }
 
     private func resetCapture() {
@@ -1017,7 +1180,7 @@ final class RecorderModel: NSObject, ObservableObject, SCContentSharingPickerObs
     }
 
     func openProject() {
-        guard phase == .idle, editor == nil else { return }
+        guard phase == .idle, editor == nil, !permissions.blocksRecording, !firstTakeInProgress else { return }
         hidePrompt()
         stopPhoneLink()
         let panel = NSOpenPanel()
@@ -1063,6 +1226,9 @@ final class RecorderModel: NSObject, ObservableObject, SCContentSharingPickerObs
         }
         editor.close()
         self.editor = nil
+        firstTakeEditorObservers.removeAll()
+        if firstTakeStep == .review || firstTakeStep == .export { firstTakeStep = .prepare }
+        if firstTakeStep == .complete { firstTakeStep = nil }
         notice = nil
         phase = .idle
         return true

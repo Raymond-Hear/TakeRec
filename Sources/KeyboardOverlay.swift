@@ -5,7 +5,7 @@ import CoreMedia
 import CoreText
 import os
 
-private let keyboardLog = Logger(subsystem: "local.takerec.community", category: "KeyboardOverlay")
+private let keyboardLog = Logger(subsystem: "local.lingfeng.DeskTake", category: "KeyboardOverlay")
 
 enum KeyboardDisplayMode: String, CaseIterable, Identifiable, Codable, Sendable {
     case shortcuts = "快捷键和操作键"

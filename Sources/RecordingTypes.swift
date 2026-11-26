@@ -67,12 +67,12 @@ enum PreviewGeometry {
 }
 
 enum TrackKind: String, CaseIterable, Identifiable, Codable, Sendable {
-    case screen, camera, camera2, camera3, system, microphone, originalAudio
+    case screen, camera, camera2, camera3, system, microphone, originalAudio, bRoll
 
     static let cameraTracks: [Self] = [.camera, .camera2, .camera3]
     var id: Self { self }
     var isCamera: Bool { Self.cameraTracks.contains(self) }
-    var isVideo: Bool { self == .screen || isCamera }
+    var isVideo: Bool { self == .screen || self == .bRoll || isCamera }
     var angleTitle: String {
         switch self {
         case .camera: "机位 1"
@@ -91,6 +91,7 @@ enum TrackKind: String, CaseIterable, Identifiable, Codable, Sendable {
         case .camera3: "camera-3.mp4"
         case .system: "system.m4a"
         case .microphone: "microphone.m4a"
+        case .bRoll: "b-roll.mp4"
         }
     }
     var title: String {
@@ -102,6 +103,7 @@ enum TrackKind: String, CaseIterable, Identifiable, Codable, Sendable {
         case .system: "系统声音"
         case .microphone: "麦克风"
         case .originalAudio: "原片声音"
+        case .bRoll: "B-roll"
         }
     }
 }

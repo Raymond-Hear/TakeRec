@@ -1,4 +1,5 @@
 @preconcurrency import AVFoundation
+import Darwin
 import Foundation
 
 struct PointerSample: Codable, Equatable, Sendable {
@@ -121,17 +122,20 @@ struct TakeManifest: Codable, Equatable, Sendable {
     var subtitleStyle: SubtitleStyle?
     var cameraNames: [TrackKind: String]?
     var cameraMirrors: [TrackKind: Bool]?
+    var titles: [SubtitleCue]?
+    var titleAppearance: TitleAppearance?
 
     var timelineClips: [TimelineClip] { clips ?? [] }
     var timelineDuration: Double { timelineClips.map(\.end).max() ?? 0 }
     var assetFiles: Set<String> {
-        var files = Set((baseTracks ?? tracks).map(\.filename)).union(timelineClips.map(\.file))
+        var files = Set((baseTracks ?? tracks).filter { $0 != .bRoll }.map(\.filename)).union(timelineClips.map(\.file))
         if let background = presentation?.portrait.backgroundAsset { files.insert(background) }
         return files
     }
     var canvasSettings: PresentationSettings { presentation ?? PresentationSettings() }
     var subtitleCues: [SubtitleCue] { subtitles ?? [] }
     var captionStyle: SubtitleStyle { subtitleStyle ?? SubtitleStyle() }
+    var titleCues: [SubtitleCue] { titles ?? [] }
     var cameraTracks: [TrackKind] { tracks.filter(\.isCamera) }
     func trackTitle(_ kind: TrackKind) -> String {
         kind.isCamera && cameraTracks.count > 1 ? kind.angleTitle : kind.title
@@ -224,6 +228,7 @@ struct RecordedMedia: Sendable {
     var microphoneGain = 1.0
     var keyboard: KeyboardTrace?
     var showsKeyboard: Bool?
+    var movie: (title: String, duration: Double)?
 }
 
 struct TakeProject: Sendable {
@@ -245,8 +250,11 @@ struct TakeProject: Sendable {
     }
 
     static func fromRecording(_ media: RecordedMedia) async throws -> Self {
-        let duration = try await durationOfScreen(in: media.folder)
-        var manifest = TakeManifest(duration: duration, tracks: media.tracks, pointer: media.pointer)
+        let duration: Double
+        if let movie = media.movie { duration = movie.duration }
+        else { duration = try await durationOfScreen(in: media.folder) }
+        var manifest = TakeManifest(duration: duration, tracks: media.tracks, pointer: media.pointer,
+                                    flattened: media.movie != nil)
         manifest.sourceOffsets = media.sourceOffsets
         if !media.cameraNames.isEmpty { manifest.cameraNames = media.cameraNames.filter { media.tracks.contains($0.key) } }
         manifest.effects.personShape = media.personShape
@@ -260,7 +268,7 @@ struct TakeProject: Sendable {
         manifest.keyboard = media.keyboard
         manifest.effects.showKeyboard = media.showsKeyboard
         if media.prioritizeNarration { manifest.applyNarrationMix() }
-        let timeline = try await makeTimeline(from: manifest, in: media.folder)
+        let timeline = try await makeTimeline(from: manifest, in: media.folder, movieTitle: media.movie?.title)
         return Self(folder: media.folder, isTemporary: true, manifest: timeline)
     }
 
@@ -299,10 +307,11 @@ struct TakeProject: Sendable {
                   FileManager.default.fileExists(atPath: url.appendingPathComponent($0).path) }) else {
             throw RecorderError.message("工程格式或素材不完整。")
         }
-        let captions = manifest.subtitleCues
-        guard Set(captions.map(\.id)).count == captions.count,
-              captions.allSatisfy({ $0.start >= 0 && $0.end > $0.start && $0.end.isFinite }) else {
-            throw RecorderError.message("工程的字幕时间线不可读。")
+        guard [manifest.subtitleCues, manifest.titleCues].allSatisfy({ cues in
+            Set(cues.map(\.id)).count == cues.count &&
+            cues.allSatisfy { $0.start >= 0 && $0.end > $0.start && $0.end.isFinite }
+        }) else {
+            throw RecorderError.message("工程的文字时间线不可读。")
         }
         if let clips = manifest.clips {
             guard Set(clips.map(\.id)).count == clips.count, clips.allSatisfy({ clip in
@@ -328,6 +337,9 @@ struct TakeProject: Sendable {
 
     private static func isMediaName(_ filename: String) -> Bool {
         if TrackKind.allCases.contains(where: { $0.filename == filename }) { return true }
+        if filename.hasPrefix("b-roll-"), filename.hasSuffix(".mp4") || filename.hasSuffix(".mov") {
+            return UUID(uuidString: String(filename.dropFirst(7).dropLast(4))) != nil
+        }
         if filename.hasPrefix("import-"), filename.hasSuffix(".mp4") {
             return UUID(uuidString: String(filename.dropFirst(7).dropLast(4))) != nil
         }
@@ -335,13 +347,15 @@ struct TakeProject: Sendable {
         return UUID(uuidString: String(filename.dropFirst(5).dropLast(4))) != nil
     }
 
-    private static func makeTimeline(from manifest: TakeManifest, in folder: URL) async throws -> TakeManifest {
+    private static func makeTimeline(from manifest: TakeManifest, in folder: URL,
+                                     movieTitle: String? = nil) async throws -> TakeManifest {
         var upgraded = manifest
         let screenEdit = manifest.edit(.screen)
         let screenURL = folder.appendingPathComponent(TrackKind.screen.filename)
         let screen = try await mediaRange(at: screenURL, kind: .screen)
-        let origin = max(screen.start.seconds, screenEdit.start)
-        let limit = min(screen.end.seconds, screenEdit.end)
+        let screenClock = manifest.sourceOffsets[.screen] ?? 0
+        let origin = max(screenClock + screen.start.seconds, screenEdit.start)
+        let limit = min(screenClock + screen.end.seconds, screenEdit.end)
         var clips: [TimelineClip] = []
         for kind in manifest.tracks {
             let edit = manifest.edit(kind)
@@ -351,7 +365,8 @@ struct TakeProject: Sendable {
             let start = max(edit.start, clock + range.start.seconds, origin - edit.offset)
             let end = min(edit.end, clock + range.end.seconds, limit - edit.offset)
             guard end - start >= TimelineClip.minimumLength - 0.00001 else { continue }
-            clips.append(TimelineClip(kind: kind, file: kind.filename, title: manifest.cameraNames?[kind] ?? kind.title,
+            let title = kind.filename == TrackKind.screen.filename ? movieTitle : manifest.cameraNames?[kind]
+            clips.append(TimelineClip(kind: kind, file: kind.filename, title: title ?? kind.title,
                                       mediaStart: range.start.seconds, mediaEnd: range.end.seconds,
                                       sourceStart: start - clock, length: end - start,
                                       at: max(0, start + edit.offset - origin)))
@@ -361,20 +376,34 @@ struct TakeProject: Sendable {
         return upgraded
     }
 
-    static func importClips(from url: URL, name: String, at time: Double) async throws -> [TimelineClip] {
-        let asset = AVURLAsset(url: url)
-        guard let video = try await asset.loadTracks(withMediaType: .video).first else {
+    static func copyMovie(_ url: URL, to target: URL) async throws {
+        try await Task.detached(priority: .userInitiated) {
+            let accessed = url.startAccessingSecurityScopedResource()
+            defer { if accessed { url.stopAccessingSecurityScopedResource() } }
+            let source = url.resolvingSymlinksInPath()
+            guard source.isFileURL, try source.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile == true else {
+                throw RecorderError.message("请选择本机的视频文件。")
+            }
+            try FileManager.default.copyItem(at: source, to: target)
+        }.value
+    }
+
+    static func importClips(from url: URL, title: String, at time: Double, as kind: TrackKind = .screen) async throws -> [TimelineClip] {
+        let asset = AVURLAsset(url: url, options: [AVURLAssetPreferPreciseDurationAndTimingKey: true])
+        guard try await asset.load(.isPlayable),
+              let video = try await asset.loadTracks(withMediaType: .video).first else {
             throw RecorderError.message("这个文件没有可用的视频轨。")
         }
-        let title = url.deletingPathExtension().lastPathComponent
+        let name = url.lastPathComponent
         let videoRange = try await video.load(.timeRange)
-        guard videoRange.duration.seconds.isFinite, videoRange.duration.seconds >= 0.05 else {
+        guard videoRange.start.isNumeric, videoRange.start >= .zero,
+              videoRange.duration.isNumeric, videoRange.duration.seconds >= 0.05 else {
             throw RecorderError.message("这个文件的画面太短。")
         }
-        var clips = [TimelineClip(kind: .screen, file: name, title: title,
+        var clips = [TimelineClip(kind: kind, file: name, title: title,
                                   mediaStart: videoRange.start.seconds, mediaEnd: videoRange.end.seconds,
                                   sourceStart: videoRange.start.seconds, length: videoRange.duration.seconds, at: time)]
-        if let audio = try await asset.loadTracks(withMediaType: .audio).first {
+        if kind == .screen, let audio = try await asset.loadTracks(withMediaType: .audio).first {
             let range = try await audio.load(.timeRange)
             let start = max(range.start.seconds, videoRange.start.seconds)
             let end = min(range.end.seconds, videoRange.end.seconds)
@@ -396,6 +425,39 @@ struct TakeProject: Sendable {
             throw RecorderError.message("无法读取\(kind.title)素材。")
         }
         return try await track.load(.timeRange)
+    }
+
+    /// Writes an agent bundle copy in place. Existing media is reused; only new
+    /// assets are cloned into the package, so repeated rounds don't copy the
+    /// whole recording again.
+    func writeAgentCopy(_ settings: TakeManifest, to package: URL) throws {
+        let files = FileManager.default
+        try files.createDirectory(at: package, withIntermediateDirectories: true,
+                                  attributes: [.posixPermissions: 0o700])
+        for filename in settings.assetFiles {
+            let target = package.appendingPathComponent(filename)
+            let origin = source(filename)
+            if let targetSize = fileSize(target), let originSize = fileSize(origin),
+               targetSize == originSize { continue }
+            let stage = package.appendingPathComponent(".asset-\(UUID().uuidString)")
+            defer { try? files.removeItem(at: stage) }
+            if clonefile(origin.path, stage.path, 0) != 0 {
+                try files.copyItem(at: origin, to: stage)
+            }
+            if files.fileExists(atPath: target.path) {
+                try files.removeItem(at: target)
+            }
+            try files.moveItem(at: stage, to: target)
+        }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        try encoder.encode(settings).write(to: package.appendingPathComponent(Self.manifestName), options: .atomic)
+    }
+
+    private func fileSize(_ url: URL) -> Int? {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let size = attributes[.size] as? NSNumber else { return nil }
+        return size.intValue
     }
 
     func save(_ settings: TakeManifest, to destination: URL) throws -> Self {

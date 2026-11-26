@@ -5,7 +5,9 @@ struct ClipTimelineView: View {
     @ObservedObject var shortcuts: ShortcutPreferences
     let maximumLaneHeight: CGFloat
     @Binding var tall: Bool
+    @Binding var autoCloseGaps: Bool
     let showSubtitles: () -> Void
+    let showTitles: () -> Void
     @State private var zoom = 0.0
     @State private var horizontalStart = 0.0
     @State private var thumbnails: [TimelineThumbnail: CGImage] = [:]
@@ -35,9 +37,10 @@ struct ClipTimelineView: View {
                         VStack(spacing: Self.laneSpacing) {
                             ruler(viewport)
                             markerLane(viewport)
+                            if !editor.manifest.titleCues.isEmpty { titleLane(viewport) }
                             subtitleLane(viewport)
                             if editor.manifest.hasKeyboardTrack { keyboardLane(viewport) }
-                            ForEach(editor.manifest.tracks) { kind in
+                            ForEach(orderedTracks) { kind in
                                 lane(kind: kind, in: viewport)
                             }
                         }
@@ -116,13 +119,19 @@ struct ClipTimelineView: View {
         min(lanesContentHeight, maximumLaneHeight)
     }
 
-    private var lanesContentHeight: CGFloat {
-        Self.laneContentHeight(trackCount: editor.manifest.tracks.count, tall: tall, keyboard: editor.manifest.hasKeyboardTrack)
+    private var orderedTracks: [TrackKind] {
+        editor.manifest.tracks.filter { $0 == .bRoll } + editor.manifest.tracks.filter { $0 != .bRoll }
     }
 
-    static func laneContentHeight(trackCount: Int, tall: Bool, keyboard: Bool = false) -> CGFloat {
+    private var lanesContentHeight: CGFloat {
+        Self.laneContentHeight(trackCount: editor.manifest.tracks.count, tall: tall,
+                               keyboard: editor.manifest.hasKeyboardTrack, titles: !editor.manifest.titleCues.isEmpty)
+    }
+
+    static func laneContentHeight(trackCount: Int, tall: Bool, keyboard: Bool = false, titles: Bool = false) -> CGFloat {
         let keys = keyboard ? keyboardHeight + laneSpacing : 0
-        return rowHeight(tall: tall) * CGFloat(trackCount) + rulerHeight + markerHeight + subtitleHeight + keys
+        let title = titles ? subtitleHeight + laneSpacing : 0
+        return rowHeight(tall: tall) * CGFloat(trackCount) + rulerHeight + markerHeight + subtitleHeight + keys + title
             + laneSpacing * CGFloat(trackCount + 2) + bottomInset
     }
 
@@ -131,6 +140,14 @@ struct ClipTimelineView: View {
     private func toolbar(_ viewport: TimelineViewport) -> some View {
         HStack(spacing: 8) {
             Text("时间线").font(.headline)
+            Menu {
+                Button("添加 B-roll 视频…") { editor.importBRoll() }.disabled(!editor.canMakeAgentBundle)
+                Button("在播放头添加花字") { editor.addTitle(); showTitles() }
+                    .disabled(editor.manifest.timelineDuration < SubtitleCue.minimumDuration)
+            } label: {
+                Label("添加", systemImage: "plus")
+            }
+            .fixedSize()
             Divider().frame(height: 15).padding(.horizontal, 2)
             Button {
                 editor.split(allTracks: false)
@@ -145,10 +162,14 @@ struct ClipTimelineView: View {
                 Button("拼接当前轨的片段") { editor.packTrack() }
                     .disabled(!editor.manifest.timelineClips.contains { $0.kind == editor.selectedTrack })
                 Divider()
-                Button("删除所选片段  \(shortcuts[.deleteClip].label)") { editor.deleteClip(closeGap: false) }
-                    .disabled(editor.selectedClip == nil)
-                Button("删去所选时间并合拢所有轨道") { editor.deleteClip(closeGap: true) }
-                    .disabled(editor.selectedClip == nil)
+                Button("删除所选  \(shortcuts[.deleteClip].label)") {
+                    editor.deleteSelection(closeGap: autoCloseGaps && editor.selectionCanCloseGap)
+                }
+                .disabled(!editor.hasDeletableSelection)
+                Button(autoCloseGaps ? "仅删除所选，保留空隙" : "删除所选时段并合拢所有轨道") {
+                    editor.deleteSelection(closeGap: !autoCloseGaps)
+                }
+                .disabled(!editor.hasDeletableSelection || !editor.selectionCanCloseGap)
             } label: {
                 Label("片段", systemImage: "link")
             }
@@ -161,8 +182,19 @@ struct ClipTimelineView: View {
             .help("撤销时间线操作 \(shortcuts[.undo].label)")
             .accessibilityLabel("撤销时间线操作")
             .disabled(!editor.hasUndo)
+            Button {
+                editor.redoClips()
+            } label: {
+                DeskIcon("redo-2", size: 14)
+            }
+            .help("重做时间线操作 \(shortcuts[.redo].label)")
+            .accessibilityLabel("重做时间线操作")
+            .disabled(!editor.hasRedo)
             Spacer(minLength: 4)
-            Toggle("吸附", isOn: $snap).toggleStyle(.checkbox)
+            Toggle("自动合拢", isOn: $autoCloseGaps).toggleStyle(.checkbox)
+                .help("删除或缩短片段时，各轨一起前移。已有空隙可右键删除。")
+            Toggle("拖动吸附", isOn: $snap).toggleStyle(.checkbox)
+                .help("拖动或裁切时吸附到附近的时间点")
             Toggle("加高", isOn: $tall).toggleStyle(.checkbox)
             Divider().frame(height: 15).padding(.horizontal, 2)
             Button {
@@ -202,9 +234,15 @@ struct ClipTimelineView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.leading, 7)
                 .frame(width: headerWidth, height: Self.markerHeight)
+            if !editor.manifest.titleCues.isEmpty {
+                Button(action: showTitles) { Label("花字轨", systemImage: "textformat") }
+                    .buttonStyle(.plain).font(.callout.weight(.semibold))
+                    .frame(maxWidth: .infinity, alignment: .leading).padding(.leading, 7)
+                    .frame(width: headerWidth, height: Self.subtitleHeight)
+            }
             subtitleHeader
             if editor.manifest.hasKeyboardTrack { keyboardHeader }
-            ForEach(editor.manifest.tracks) { kind in
+            ForEach(orderedTracks) { kind in
                 HStack(spacing: 4) {
                     Button {
                         editor.selectTrack(kind)
@@ -268,9 +306,31 @@ struct ClipTimelineView: View {
                 .buttonStyle(.plain).padding(8)
             }
             ForEach(cues.filter { $0.end > viewport.start && $0.start < viewport.end }) { cue in
-                SubtitleTile(cue: cue, viewport: viewport, snapping: snap, height: Self.subtitleHeight,
-                             editor: editor, showSubtitles: showSubtitles)
+                TextCueTile(cue: cue, viewport: viewport, snapping: snap, height: Self.subtitleHeight,
+                            duration: editor.manifest.timelineDuration, playhead: editor.playhead,
+                            selected: editor.selectedSubtitleID == cue.id, enabled: editor.captionStyle.enabled,
+                            color: WorkbenchStyle.accent,
+                            select: { editor.selectSubtitle(cue, seek: $0); showSubtitles() },
+                            update: { editor.updateSubtitle($0); editor.selectSubtitle($0) })
                     .zIndex(editor.selectedSubtitleID == cue.id ? 1 : 0)
+            }
+        }
+        .frame(width: viewport.width, height: Self.subtitleHeight)
+        .clipped()
+    }
+
+    private func titleLane(_ viewport: TimelineViewport) -> some View {
+        ZStack(alignment: .topLeading) {
+            RoundedRectangle(cornerRadius: 4).fill(WorkbenchStyle.lane)
+                .contentShape(Rectangle())
+                .gesture(SpatialTapGesture().onEnded { editor.seek(to: viewport.time(at: $0.location.x)) })
+            ForEach(editor.manifest.titleCues.filter { $0.end > viewport.start && $0.start < viewport.end }) { cue in
+                TextCueTile(cue: cue, viewport: viewport, snapping: snap, height: Self.subtitleHeight,
+                            duration: editor.manifest.timelineDuration, playhead: editor.playhead,
+                            selected: editor.selectedTitleID == cue.id, enabled: true, color: WorkbenchStyle.marker,
+                            select: { editor.selectTitle(cue, seek: $0); showTitles() },
+                            update: { editor.updateTitle($0); editor.selectTitle($0) })
+                    .zIndex(editor.selectedTitleID == cue.id ? 1 : 0)
             }
         }
         .frame(width: viewport.width, height: Self.subtitleHeight)
@@ -409,13 +469,35 @@ struct ClipTimelineView: View {
                     editor.selectTrack(kind)
                     editor.seek(to: viewport.time(at: $0.location.x))
                 })
+            ForEach(editor.gaps(on: kind).filter { $0.upperBound > viewport.start && $0.lowerBound < viewport.end }, id: \.self) { gap in
+                gapTarget(gap, on: kind, in: viewport, height: row)
+            }
             ForEach(clips) { clip in
-                TimelineTile(clip: clip, viewport: viewport, row: row, snapping: snap,
+                TimelineTile(clip: clip, viewport: viewport, row: row, snapping: snap, autoCloseGaps: autoCloseGaps,
                              thumbnails: thumbnails, editor: editor)
             }
         }
         .frame(width: viewport.width, height: row)
         .clipped()
+    }
+
+    private func gapTarget(_ gap: Range<Double>, on kind: TrackKind, in viewport: TimelineViewport, height: CGFloat) -> some View {
+        let left = max(0, viewport.x(at: gap.lowerBound))
+        let width = min(viewport.width, viewport.x(at: gap.upperBound)) - left
+        return Rectangle().fill(.clear)
+            .frame(width: width, height: height)
+            .contentShape(Rectangle())
+            .gesture(SpatialTapGesture().onEnded {
+                editor.selectTrack(kind)
+                editor.seek(to: viewport.time(at: left + $0.location.x))
+            })
+            .contextMenu {
+                Button("删除空隙并合拢各轨") { editor.deleteGap(gap, on: kind) }
+                Text("各轨同时剪去这段时间。")
+            }
+            .accessibilityLabel("\(kind.title)空隙，\(timelineTime(gap.lowerBound))至\(timelineTime(gap.upperBound))")
+            .accessibilityAction(named: Text("删除空隙并合拢各轨")) { editor.deleteGap(gap, on: kind) }
+            .position(x: left + width / 2, y: height / 2)
     }
 
     private func playhead(_ viewport: TimelineViewport) -> some View {
@@ -441,17 +523,21 @@ struct ClipTimelineView: View {
     }
 }
 
-private struct SubtitleTile: View {
+private struct TextCueTile: View {
     let cue: SubtitleCue
     let viewport: TimelineViewport
     let snapping: Bool
     let height: CGFloat
-    @ObservedObject var editor: TakeEditorModel
-    let showSubtitles: () -> Void
+    let duration: Double
+    let playhead: Double
+    let selected: Bool
+    let enabled: Bool
+    let color: Color
+    let select: (Bool) -> Void
+    let update: (SubtitleCue) -> Void
     @State private var draft: SubtitleCue?
 
     private enum Edge { case start, center, end }
-    private var selected: Bool { cue.id == editor.selectedSubtitleID }
 
     var body: some View {
         let displayed = draft ?? cue
@@ -471,47 +557,38 @@ private struct SubtitleTile: View {
                     .clipped()
                     .contentShape(Rectangle())
                     .gesture(dragging(.center))
-                    .simultaneousGesture(TapGesture().onEnded { select() })
+                    .simultaneousGesture(TapGesture().onEnded { select(true) })
                 handle(.end, width: end <= viewport.width ? grip : 0)
             }
             .frame(width: width, height: height - 6)
-            .background(WorkbenchStyle.accent.opacity(selected ? 0.28 : 0.15))
+            .background(color.opacity(selected ? 0.28 : 0.15))
             .overlay {
-                RoundedRectangle(cornerRadius: 4).strokeBorder(WorkbenchStyle.accent.opacity(selected ? 0.92 : 0.25))
+                RoundedRectangle(cornerRadius: 4).strokeBorder(color.opacity(selected ? 0.92 : 0.25))
                     .allowsHitTesting(false)
             }
             .clipShape(RoundedRectangle(cornerRadius: 4))
-            .opacity(editor.captionStyle.enabled ? 1 : 0.55)
+            .opacity(enabled ? 1 : 0.55)
             .offset(x: left, y: 3)
             .accessibilityElement(children: .ignore)
             .accessibilityLabel(cue.text)
-            .accessibilityAction { select() }
+            .accessibilityAction { select(true) }
         }
     }
 
     private func handle(_ edge: Edge, width: Double) -> some View {
-        Rectangle().fill(WorkbenchStyle.accent.opacity(selected ? 0.27 : 0.08))
+        Rectangle().fill(color.opacity(selected ? 0.27 : 0.08))
             .frame(width: width)
             .overlay { if selected, width > 3 { Capsule().fill(.primary.opacity(0.55)).frame(width: 2, height: 10) } }
             .contentShape(Rectangle())
             .gesture(dragging(edge))
-            .help(edge == .start ? "拖动调整字幕入点" : "拖动调整字幕出点")
-    }
-
-    private func select() {
-        editor.selectSubtitle(cue)
-        showSubtitles()
+            .help(edge == .start ? "拖动调整入点" : "拖动调整出点")
     }
 
     private func dragging(_ edge: Edge) -> some Gesture {
         DragGesture(minimumDistance: 2, coordinateSpace: .global)
             .onChanged { value in
-                if !selected {
-                    editor.selectSubtitle(cue, seek: false)
-                    showSubtitles()
-                }
+                if !selected { select(false) }
                 let shift = value.translation.width / viewport.scale
-                let duration = editor.manifest.timelineDuration
                 let minimum = min(cue.end - cue.start, SubtitleCue.minimumDuration)
                 var next = cue
                 switch edge {
@@ -529,16 +606,13 @@ private struct SubtitleTile: View {
                 draft = next
             }
             .onEnded { _ in
-                if let draft {
-                    editor.updateSubtitle(draft)
-                    editor.selectSubtitle(draft)
-                }
+                if let draft { update(draft) }
                 draft = nil
             }
     }
 
     private func snapped(_ time: Double) -> Double {
-        snapping && abs(time - editor.playhead) * viewport.scale <= 8 ? editor.playhead : time
+        snapping && abs(time - playhead) * viewport.scale <= 8 ? playhead : time
     }
 }
 
@@ -547,6 +621,7 @@ private struct TimelineTile: View {
     let viewport: TimelineViewport
     let row: CGFloat
     let snapping: Bool
+    let autoCloseGaps: Bool
     let thumbnails: [TimelineThumbnail: CGImage]
     @ObservedObject var editor: TakeEditorModel
     @State private var drag: TimelineClip?
@@ -572,6 +647,9 @@ private struct TimelineTile: View {
                     Text(clip.title)
                         .font(.caption.weight(.semibold)).lineLimit(1)
                         .layoutPriority(1)
+                    if clip.fullFrame == true, width > 92 {
+                        Text("全屏").font(.caption2).foregroundStyle(.secondary)
+                    }
                     Spacer(minLength: 0)
                     if clip.kind.isVideo, width > 145 {
                         Text(timelineTime(displayed.length))
@@ -609,6 +687,14 @@ private struct TimelineTile: View {
         .accessibilityLabel("\(clip.kind.title)，\(clip.title)，从 \(timelineTime(displayed.at)) 到 \(timelineTime(displayed.end))")
         .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton)
         .accessibilityAction { editor.select(clip) }
+        .contextMenu {
+            if clip.kind.isCamera {
+                Button(clip.fullFrame == true ? "恢复画中画" : "此片段人像全屏") {
+                    editor.setCameraFullFrame(clip, clip.fullFrame != true)
+                }
+                .disabled(clip.hidden == true || !editor.manifest.edit(clip.kind).enabled)
+            }
+        }
     }
 
     private var waveform: some View {
@@ -667,13 +753,13 @@ private struct TimelineTile: View {
                     drag = ClipEdit.trimmed(clip, left: left, to: edge, among: editor.manifest.timelineClips,
                                             playhead: editor.playhead, snap: threshold)
                 }
-                .onEnded { _ in finishDrag() })
+                .onEnded { _ in finishDrag(closingTrimGap: autoCloseGaps) })
     }
 
     private var threshold: Double { snapping ? 8 / viewport.scale : 0 }
 
-    private func finishDrag() {
-        if let drag { editor.editClip(drag) }
+    private func finishDrag(closingTrimGap: Bool = false) {
+        if let drag { editor.editClip(drag, closingTrimGap: closingTrimGap) }
         drag = nil
     }
 }

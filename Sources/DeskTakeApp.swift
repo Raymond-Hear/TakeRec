@@ -6,6 +6,7 @@ struct TakeRecApp: App {
     @StateObject private var model = RecorderModel()
     @StateObject private var preferences = ShortcutPreferences()
     @NSApplicationDelegateAdaptor(TakeRecDelegate.self) private var delegate
+    private let restoringPermissions = RecordingPermissions.resumesGuideOnLaunch
 
     var body: some Scene {
         Window("简录 · TakeRec", id: "recorder") {
@@ -14,6 +15,14 @@ struct TakeRecApp: App {
         .windowResizability(.contentMinSize)
         .defaultSize(width: 1160, height: 850)
         .defaultPosition(.center)
+        .defaultLaunchBehavior(.presented)
+        .restorationBehavior(restoringPermissions ? .disabled : .automatic)
+        .commands {
+            CommandGroup(after: .help) {
+                Button("新手教程") { model.beginFirstTakeTutorial() }
+                    .disabled(!model.canRestartForPermissions || model.permissions.isOnboarding || model.firstTakeInProgress)
+            }
+        }
 
         Settings { ShortcutSettingsView(preferences: preferences) }
     }
@@ -29,7 +38,8 @@ private struct RecorderWindow: View {
         Group {
             if model.phase == .ready, let editor = model.editor {
                 TakeEditorView(editor: editor, shortcuts: preferences, leave: { _ = model.closeEditor() },
-                               continueRecording: { model.continueRecording() })
+                               continueRecording: { model.continueRecording() },
+                               firstTakeStep: model.firstTakeStep)
             } else {
                 RecorderView(model: model, shortcuts: preferences)
             }
@@ -134,6 +144,8 @@ final class TakeRecDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
+    func applicationWillTerminate(_ notification: Notification) { model?.movieDemo?.close() }
+
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard let model else { return .terminateNow }
         switch model.phase {
@@ -194,14 +206,16 @@ final class RecordingStatusItem: NSObject, NSMenuDelegate {
                     add("\(model.audioMeterTitle) \(String(format: "%.0f dBFS", level))")
                 }
             }
-            add(model.isPaused ? "继续录制" : "暂停录制", #selector(togglePause))
+            if !model.firstTakeInProgress { add(model.isPaused ? "继续录制" : "暂停录制", #selector(togglePause)) }
             let stop = model.activeShortcutLabels[.stop].map { "结束录制  \($0)" } ?? "结束录制"
             add(stop, #selector(stopRecording))
             if model.canShowRecordingPanels {
                 menu.addItem(.separator())
-                add(model.controlsVisible ? "隐藏录制控制条" : "显示录制控制条", #selector(toggleStrip))
-                if !model.teleprompter.pages.isEmpty {
-                    add(model.promptVisible ? "隐藏提词器" : "显示提词器", #selector(togglePrompt))
+                if !model.firstTakeInProgress {
+                    add(model.controlsVisible ? "隐藏录制控制条" : "显示录制控制条", #selector(toggleStrip))
+                    if !model.teleprompter.pages.isEmpty {
+                        add(model.promptVisible ? "隐藏提词器" : "显示提词器", #selector(togglePrompt))
+                    }
                 }
                 add("找回录制浮窗", #selector(recoverPanels))
             } else if let notice = model.recordingPanelAvailability?.notice {

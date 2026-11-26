@@ -2,12 +2,18 @@
 set -euo pipefail
 
 project="$(cd -- "$(dirname -- "$0")" && pwd)"
-bundle_id=local.takerec.community
+bundle_id=local.lingfeng.DeskTake
 entitlements="$project/App/DeskTake.entitlements"
 condition=TAKEREC_DESKTOP
+signing_identity="${DESKTAKE_SIGN_IDENTITY:--}"
+signing_args=(--force --sign "$signing_identity")
+# Library validation requires a Team ID, which ad-hoc local builds do not have.
+if [[ "$signing_identity" != - ]]; then
+    signing_args+=(--options runtime)
+fi
 if [[ "${1:-}" == --store ]]; then
     shift
-    bundle_id=local.takerec.community.StorePreview
+    bundle_id=local.lingfeng.DeskTake.StorePreview
     entitlements="$project/App/DeskTake-Store.entitlements"
     condition=TAKEREC_STORE
     if [[ -z "${1:-}" ]]; then
@@ -15,21 +21,7 @@ if [[ "${1:-}" == --store ]]; then
         exit 2
     fi
 fi
-configuration="${TAKEREC_BUILD_CONFIGURATION:-release}"
-architectures=(arm64 x86_64)
-swift_flags=(-O -file-prefix-map "$project=TakeRec")
-case "$configuration" in
-    release) ;;
-    debug)
-        architectures=("$(uname -m)")
-        swift_flags=(-Onone -g)
-        ;;
-    *)
-        printf 'TAKEREC_BUILD_CONFIGURATION 须为 debug 或 release。\n' >&2
-        exit 2
-        ;;
-esac
-app="${1:-"$project/简录.app"}"
+app="${1:-"$project/build.noindex/简录.app"}"
 if [[ "$app" != /* ]]; then
     app="$PWD/$app"
 fi
@@ -62,7 +54,7 @@ cleanup() {
 }
 trap cleanup EXIT
 bundle="$build/简录.app"
-mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources"
+mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources" "$bundle/Contents/Helpers"
 cp "$project/App/Info.plist" "$bundle/Contents/Info.plist"
 if [[ "$condition" == TAKEREC_STORE ]]; then
     /usr/bin/plutil -replace CFBundleIdentifier -string "$bundle_id" "$bundle/Contents/Info.plist"
@@ -89,37 +81,47 @@ if ! xcrun actool --compile "$bundle/Contents/Resources" --platform macosx \
     exit 1
 fi
 cp "$project/App/Lucide-LICENSE.txt" "$bundle/Contents/Resources/"
-cp "$project/LICENSE" "$bundle/Contents/Resources/TakeRec-LICENSE.txt"
 if [[ "$condition" == TAKEREC_DESKTOP ]]; then
-    mkdir -p "$bundle/Contents/Resources/PhoneReceiver"
-    for file in receiver.html receiver.js vdoninja-sdk.js VDO-Ninja-MPL-2.0.txt; do
-        cp "$project/App/PhoneReceiver/$file" "$bundle/Contents/Resources/PhoneReceiver/"
-    done
+    cp -R "$project/App/PhoneReceiver" "$bundle/Contents/Resources/PhoneReceiver"
+fi
+
+proofreader="$project/build.noindex/ProofreaderDependencies"
+proofreader_framework="$proofreader/llama.framework"
+proofreader_model="$proofreader/qwen2.5-1.5b-instruct-q4_k_m.gguf"
+proofreader_flags=()
+if [[ -d "$proofreader_framework" || -f "$proofreader_model" ]]; then
+    if [[ ! -d "$proofreader_framework" || ! -f "$proofreader_model" ]]; then
+        printf '离线校对资源不全，请先准备引擎和模型。\n' >&2
+        exit 2
+    fi
+    mkdir -p "$bundle/Contents/Frameworks"
+    ditto "$proofreader_framework" "$bundle/Contents/Frameworks/llama.framework"
+    cp -c "$proofreader_model" "$bundle/Contents/Resources/" 2>/dev/null || cp "$proofreader_model" "$bundle/Contents/Resources/"
+    cp "$project/App/LlamaCpp-LICENSE.txt" "$project/App/Qwen-LICENSE.txt" "$bundle/Contents/Resources/"
+    codesign "${signing_args[@]}" "$bundle/Contents/Frameworks/llama.framework"
+    proofreader_flags=(-F "$proofreader" -framework llama -Xlinker -rpath -Xlinker @executable_path/../Frameworks)
 fi
 
 sdk="$(xcrun --sdk macosx --show-sdk-path)"
-executables=()
-for arch in "${architectures[@]}"; do
-    mkdir -p "$build/$arch"
-    executable="$build/$arch/TakeRec"
-    xcrun --sdk macosx swiftc -swift-version 5 "${swift_flags[@]}" -parse-as-library -D "$condition" \
+for arch in arm64 x86_64; do
+    xcrun --sdk macosx swiftc -swift-version 5 -O -parse-as-library -D "$condition" \
         -target "$arch-apple-macosx15.0" -sdk "$sdk" \
         -module-cache-path "$build/modules" -module-name TakeRec \
-        "$project"/Sources/*.swift -o "$executable"
-    executables+=("$executable")
+        ${proofreader_flags[@]+"${proofreader_flags[@]}"} "$project"/Sources/*.swift -o "$build/TakeRec-$arch"
+    xcrun --sdk macosx swiftc -swift-version 5 -O -parse-as-library \
+        -target "$arch-apple-macosx15.0" -sdk "$sdk" \
+        -module-cache-path "$build/modules" "$project/App/TakeRecRelaunch.swift" -o "$build/TakeRecRelaunch-$arch"
 done
-if [[ "$configuration" == debug ]]; then
-    mv "${executables[0]}" "$bundle/Contents/MacOS/TakeRec"
-    mv "${executables[0]}.dSYM" "$bundle/Contents/Resources/TakeRec.dSYM"
-    cp "$entitlements" "$build/Debug.entitlements"
-    entitlements="$build/Debug.entitlements"
-    /usr/libexec/PlistBuddy -c 'Add :com.apple.security.get-task-allow bool true' "$entitlements"
-else
-    xcrun lipo -create "${executables[@]}" -output "$bundle/Contents/MacOS/TakeRec"
+xcrun lipo -create "$build/TakeRec-arm64" "$build/TakeRec-x86_64" -output "$bundle/Contents/MacOS/TakeRec"
+helper="$bundle/Contents/Helpers/TakeRecRelaunch"
+xcrun lipo -create "$build/TakeRecRelaunch-arm64" "$build/TakeRecRelaunch-x86_64" -output "$helper"
+helper_signing=("${signing_args[@]}" --identifier "$bundle_id.Relaunch")
+if [[ "$condition" == TAKEREC_STORE ]]; then
+    helper_signing+=(--entitlements "$project/App/DeskTake-Relaunch-Store.entitlements")
 fi
-codesign --force --sign "${DESKTAKE_SIGN_IDENTITY:--}" --options runtime \
-    --entitlements "$entitlements" "$bundle"
-codesign --verify --strict "$bundle"
+codesign "${helper_signing[@]}" "$helper"
+codesign "${signing_args[@]}" --entitlements "$entitlements" "$bundle"
+codesign --verify --deep --strict "$bundle"
 
 if [[ -e "$app" ]]; then
     mv -- "$app" "$build/previous.app"

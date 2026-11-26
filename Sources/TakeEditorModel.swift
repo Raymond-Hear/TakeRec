@@ -4,7 +4,7 @@ import CoreImage
 import UniformTypeIdentifiers
 
 extension UTType {
-    static let deskTakeProject = UTType(exportedAs: "local.takerec.desktake-project", conformingTo: .package)
+    static let deskTakeProject = UTType(exportedAs: "local.lingfeng.desktake-project", conformingTo: .package)
 }
 
 @MainActor
@@ -13,6 +13,7 @@ final class TakeEditorModel: ObservableObject {
     @Published var selectedTrack = TrackKind.screen
     @Published private(set) var selectedClipID: UUID?
     @Published private(set) var selectedSubtitleID: UUID?
+    @Published private(set) var selectedTitleID: UUID?
     @Published private(set) var playhead = 0.0
     @Published private(set) var playing = false
     @Published private(set) var activity: String?
@@ -26,6 +27,7 @@ final class TakeEditorModel: ObservableObject {
     @Published private(set) var previewReady = false
     @Published private(set) var waveforms: [String: AudioWaveform] = [:]
     @Published private(set) var hasUndo = false
+    @Published private(set) var hasRedo = false
 
     let player = AVPlayer()
     let thumbnailCache = TimelineThumbnailCache()
@@ -36,10 +38,12 @@ final class TakeEditorModel: ObservableObject {
     private var waveformTask: Task<Void, Never>?
     private var observer: Any?
     private enum UndoEdit {
-        case timeline(TakeManifest, captionsChanged: Bool)
+        case timeline(TakeManifest, captionsChanged: Bool, titlesChanged: Bool)
         case captions([SubtitleCue]?)
+        case titles([SubtitleCue]?)
     }
     private var undo: [UndoEdit] = []
+    private var redo: [UndoEdit] = []
     private var appendedTakes: [TakeProject] = []
     private var clickPreview: NSSound?
 
@@ -64,6 +68,9 @@ final class TakeEditorModel: ObservableObject {
     var duration: Double { max(0.10, manifest.timelineDuration) }
     var selectedClip: TimelineClip? { manifest.timelineClips.first { $0.id == selectedClipID } }
     var selectedSubtitle: SubtitleCue? { manifest.subtitleCues.first { $0.id == selectedSubtitleID } }
+    var selectedTitle: SubtitleCue? { manifest.titleCues.first { $0.id == selectedTitleID } }
+    var hasDeletableSelection: Bool { selectedClip != nil || selectedSubtitle != nil || selectedTitle != nil }
+    var selectionCanCloseGap: Bool { selectedTitle == nil && selectedClip?.kind != .bRoll }
     var sourceAspect: CGFloat { preview?.instruction.sourceAspect ?? 16.0 / 9 }
 
     var canvas: PresentationSettings {
@@ -77,12 +84,14 @@ final class TakeEditorModel: ObservableObject {
     }
 
     func select(_ clip: TimelineClip) {
+        if selectedTitleID != nil { selectedTitleID = nil }
         if selectedSubtitleID != nil { selectedSubtitleID = nil }
         if selectedTrack != clip.kind { selectedTrack = clip.kind }
         if selectedClipID != clip.id { selectedClipID = clip.id }
     }
 
     func selectTrack(_ track: TrackKind) {
+        if selectedTitleID != nil { selectedTitleID = nil }
         if selectedSubtitleID != nil { selectedSubtitleID = nil }
         selectedTrack = track
         if selectedClip?.kind != track { selectedClipID = nil }
@@ -120,6 +129,12 @@ final class TakeEditorModel: ObservableObject {
         var changed = clip
         changed.hidden = visible ? nil : true
         editClip(changed)
+    }
+
+    func setCameraFullFrame(_ clip: TimelineClip, _ enabled: Bool) {
+        guard clip.kind.isCamera, var current = manifest.timelineClips.first(where: { $0.id == clip.id }) else { return }
+        current.fullFrame = enabled ? true : nil
+        editClip(current)
     }
 
     func canSwitchCamera(to kind: TrackKind) -> Bool {
@@ -161,24 +176,62 @@ final class TakeEditorModel: ObservableObject {
         commit(clips, selecting: selected)
     }
 
-    func editClip(_ clip: TimelineClip) {
+    func editClip(_ clip: TimelineClip, closingTrimGap: Bool = false) {
         var clips = manifest.timelineClips
         guard let index = clips.firstIndex(where: { $0.id == clip.id }) else { return }
+        let original = clips[index]
         clips[index] = clip
+        if closingTrimGap, clip.kind != .bRoll {
+            let interval: Range<Double>?
+            if clip.at > original.at { interval = original.at..<clip.at }
+            else if clip.end < original.end { interval = clip.end..<original.end }
+            else { interval = nil }
+            if let interval, interval.upperBound - interval.lowerBound > 0.00001 {
+                removeTime(ClipEdit.adjoiningGap(for: interval, on: clip.kind, in: clips), selecting: clip.id)
+                return
+            }
+        }
         commit(clips, selecting: clip.id)
     }
 
-    func deleteClip(closeGap: Bool) {
-        guard let clip = selectedClip else { return }
-        if closeGap {
-            var next = manifest
-            next.clips = ClipEdit.removeTime(from: clip.at, to: clip.end, in: manifest.timelineClips)
-            next.subtitles = next.subtitles?.compactMap { $0.removingTime(from: clip.at, to: clip.end) }
-            commitTimeline(next, selecting: nil)
-            seek(to: clip.at)
-        } else {
-            commit(manifest.timelineClips.filter { $0.id != clip.id }, selecting: nil)
+    func deleteSelection(closeGap: Bool) {
+        if selectedTitle != nil {
+            deleteTitle()
+        } else if let cue = selectedSubtitle {
+            let end = min(cue.end, manifest.timelineDuration)
+            if closeGap, end > cue.start {
+                removeTime(cue.start..<end, removingSubtitle: cue.id)
+            } else {
+                deleteSubtitle()
+            }
+        } else if let clip = selectedClip {
+            if closeGap && clip.kind != .bRoll {
+                let remaining = manifest.timelineClips.filter { $0.id != clip.id }
+                removeTime(ClipEdit.adjoiningGap(for: clip.at..<clip.end, on: clip.kind, in: remaining))
+            } else {
+                commit(manifest.timelineClips.filter { $0.id != clip.id }, selecting: nil)
+            }
         }
+    }
+
+    func gaps(on kind: TrackKind) -> [Range<Double>] {
+        guard kind != .bRoll else { return [] }
+        return ClipEdit.gaps(in: manifest.timelineClips, kind: kind, duration: manifest.timelineDuration)
+    }
+
+    func deleteGap(_ gap: Range<Double>, on kind: TrackKind) {
+        guard gaps(on: kind).contains(gap) else { return }
+        removeTime(gap)
+    }
+
+    private func removeTime(_ interval: Range<Double>, selecting selection: UUID? = nil, removingSubtitle id: UUID? = nil) {
+        let (start, end) = (interval.lowerBound, interval.upperBound)
+        var next = manifest
+        next.clips = ClipEdit.removeTime(from: start, to: end, in: manifest.timelineClips)
+        next.subtitles = next.subtitles?.compactMap { $0.id == id ? nil : $0.removingTime(from: start, to: end) }
+        next.titles = next.titles?.compactMap { $0.removingTime(from: start, to: end) }
+        commitTimeline(next, selecting: selection)
+        seek(to: start)
     }
 
     func packTrack() {
@@ -187,9 +240,39 @@ final class TakeEditorModel: ObservableObject {
 
     func undoClips() {
         guard let edit = undo.popLast() else { return }
+        redo.append(inverse(of: edit))
+        if redo.count > 40 { redo.removeFirst() }
+        apply(edit)
+        if case .captions = edit { subtitleNotice = "已撤销字幕修改。" }
+        hasUndo = !undo.isEmpty
+        hasRedo = true
+    }
+
+    func redoClips() {
+        guard let edit = redo.popLast() else { return }
+        undo.append(inverse(of: edit))
+        if undo.count > 40 { undo.removeFirst() }
+        apply(edit)
+        if case .captions = edit { subtitleNotice = "已重做字幕修改。" }
+        hasUndo = true
+        hasRedo = !redo.isEmpty
+    }
+
+    private func inverse(of edit: UndoEdit) -> UndoEdit {
+        switch edit {
+        case .timeline(_, let captionsChanged, let titlesChanged):
+            return .timeline(manifest, captionsChanged: captionsChanged, titlesChanged: titlesChanged)
+        case .captions:
+            return .captions(manifest.subtitles)
+        case .titles:
+            return .titles(manifest.titles)
+        }
+    }
+
+    private func apply(_ edit: UndoEdit) {
         pause()
         switch edit {
-        case .timeline(let previous, let captionsChanged):
+        case .timeline(let previous, let captionsChanged, let titlesChanged):
             var restored = manifest
             restored.clips = previous.clips
             restored.tracks = previous.tracks
@@ -200,17 +283,20 @@ final class TakeEditorModel: ObservableObject {
                 return screens.merging(current) { _, current in current }
             }
             if captionsChanged { restored.subtitles = previous.subtitles }
+            if titlesChanged { restored.titles = previous.titles }
             for file in manifest.assetFiles.subtracting(restored.assetFiles) {
                 restored.extraFocus?.removeValue(forKey: file)
             }
             manifest = restored
         case .captions(let previous):
             manifest.subtitles = previous
+        case .titles(let previous):
+            manifest.titles = previous
         }
         if selectedClip == nil { selectedClipID = nil }
         if selectedSubtitle == nil { selectedSubtitleID = nil }
+        if selectedTitle == nil { selectedTitleID = nil }
         playhead = min(playhead, duration)
-        hasUndo = !undo.isEmpty
     }
 
     private func commit(_ clips: [TimelineClip], selecting id: UUID?) {
@@ -221,20 +307,25 @@ final class TakeEditorModel: ObservableObject {
 
     private func commitTimeline(_ next: TakeManifest, selecting id: UUID?) {
         let clips = next.timelineClips
-        guard manifest.timelineClips != clips else { return }
+        let captionsChanged = manifest.subtitles != next.subtitles
+        let titlesChanged = manifest.titles != next.titles
+        guard manifest.timelineClips != clips || captionsChanged || titlesChanged else { return }
         pause()
-        recordUndo(.timeline(manifest, captionsChanged: manifest.subtitles != next.subtitles))
+        recordUndo(.timeline(manifest, captionsChanged: captionsChanged, titlesChanged: titlesChanged))
         manifest = next
         if let id, let selected = clips.first(where: { $0.id == id }) { select(selected) }
         else { selectedClipID = nil }
         if selectedSubtitle == nil { selectedSubtitleID = nil }
+        if selectedTitle == nil { selectedTitleID = nil }
         playhead = min(playhead, duration)
     }
 
     private func recordUndo(_ edit: UndoEdit) {
         undo.append(edit)
         if undo.count > 40 { undo.removeFirst() }
+        redo.removeAll()
         hasUndo = true
+        hasRedo = false
     }
 
     func pauseForRecording() { pause() }
@@ -266,7 +357,7 @@ final class TakeEditorModel: ObservableObject {
             !manifest.tracks.contains(kind) && additions.contains { $0.kind == kind }
         }
         let angles = TrackKind.cameraTracks.filter { next.tracks.contains($0) }
-        next.tracks = [.screen] + angles + next.tracks.filter { !$0.isVideo }
+        next.tracks = [.screen] + angles + next.tracks.filter { $0 != .screen && !$0.isCamera }
         var cameraNames = next.cameraNames ?? [:]
         for kind in take.manifest.cameraTracks where additions.contains(where: { $0.kind == kind }) {
             let name = take.manifest.cameraNames?[kind]
@@ -278,6 +369,11 @@ final class TakeEditorModel: ObservableObject {
             var microphone = next.edit(.microphone)
             microphone.volume = take.manifest.edit(.microphone).volume
             next.edits[.microphone] = microphone
+        }
+        if next.tracks.contains(.originalAudio), !manifest.tracks.contains(.originalAudio) {
+            var audio = next.edit(.originalAudio)
+            audio.volume = take.manifest.edit(.originalAudio).volume
+            next.edits[.originalAudio] = audio
         }
         next.clips = manifest.timelineClips + additions
         if let recorded = take.manifest.screenRecording(for: screen.file), let name = names[screen.file] {
@@ -302,25 +398,38 @@ final class TakeEditorModel: ObservableObject {
         panel.title = "追加 MP4 素材"
         panel.allowedContentTypes = [.mpeg4Movie]
         panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = true
         activity = "选择追加素材"
         panel.begin { response in
-            guard response == .OK, let url = panel.url else {
+            guard response == .OK, !panel.urls.isEmpty else {
                 self.activity = nil
                 return
             }
-            self.appendMovie(url)
+            self.appendMovies(panel.urls)
         }
+    }
+
+    func pasteMovies(from pasteboard: NSPasteboard = .general) {
+        guard !isBusy else { return }
+        let files = pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? []
+        let movies = files.filter { $0.isFileURL && $0.pathExtension.lowercased() == "mp4" }
+        guard !movies.isEmpty else {
+            notice = "先在访达复制一个或多个 MP4 文件，再回到剪辑工作台粘贴。"
+            return
+        }
+        appendMovies(movies)
     }
 
     func makeAgentBundle() {
         guard !isBusy, canMakeAgentBundle else { return }
         let panel = NSOpenPanel()
         panel.title = "选择存放 Agent 素材包的文件夹"
-        panel.message = "素材包包含当前工程和分轨原片。"
+        panel.message = "素材包包含当前工程和分轨原片。再次生成会更新同一个素材包，只补齐新增素材。"
         panel.prompt = "生成素材包"
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
         panel.canCreateDirectories = true
+        panel.directoryURL = lastAgentBundle?.deletingLastPathComponent()
         activity = "选择素材包位置"
         presentAgentPicker(panel) { response in
             guard response == .OK, let parent = panel.url else { self.activity = nil; return }
@@ -336,13 +445,14 @@ final class TakeEditorModel: ObservableObject {
         Task {
             defer { activity = nil }
             do {
-                let folder = try await Task.detached(priority: .userInitiated) {
+                let bundle = try await Task.detached(priority: .userInitiated) {
                     try AgentHandoff.makeBundle(project: source, manifest: settings, in: parent)
                 }.value
-                lastAgentBundle = folder
+                lastAgentBundle = bundle.url
                 NSPasteboard.general.clearContents()
-                let copied = NSPasteboard.general.setString(AgentHandoff.prompt(for: folder), forType: .string)
-                notice = "素材包已生成 · \(folder.lastPathComponent)。\(copied ? "提示词已复制，粘贴给你的 Agent 即可。" : "请把包内的 AGENT.md 提供给你的 Agent。")"
+                let copied = NSPasteboard.general.setString(AgentHandoff.prompt(for: bundle.url), forType: .string)
+                let prefix = bundle.updated ? "素材包已更新" : "素材包已生成"
+                notice = "\(prefix) · \(bundle.url.lastPathComponent)。\(copied ? "提示词已复制，粘贴给你的 Agent 即可。" : "请把包内的 AGENT.md 提供给你的 Agent。")"
             } catch {
                 notice = "生成 Agent 素材包失败。\(error.localizedDescription)"
             }
@@ -371,6 +481,7 @@ final class TakeEditorModel: ObservableObject {
                     next.clips = clips
                     for cut in plan.cuts.sorted(by: { $0.start > $1.start }) {
                         next.subtitles = next.subtitles?.compactMap { $0.removingTime(from: cut.start, to: cut.end) }
+                        next.titles = next.titles?.compactMap { $0.removingTime(from: cut.start, to: cut.end) }
                     }
                     self.commitTimeline(next, selecting: nil)
                     self.notice = "Agent 剪辑已应用 · 删除 \(plan.cuts.count) 个时段，可预览或撤销。"
@@ -389,22 +500,28 @@ final class TakeEditorModel: ObservableObject {
         }
     }
 
-    private func appendMovie(_ url: URL) {
+    private func appendMovies(_ urls: [URL]) {
         activity = "正在读入素材"
-        let filename = "import-\(UUID()).mp4"
-        let target = cache.appendingPathComponent(filename)
         let time = manifest.timelineDuration
         Task {
             defer { activity = nil }
+            var files: [String: URL] = [:]
             do {
-                let new = try await TakeProject.importClips(from: url, name: filename, at: time)
-                try await Task.detached(priority: .userInitiated) {
-                    try FileManager.default.createDirectory(at: target.deletingLastPathComponent(),
-                                                            withIntermediateDirectories: true,
-                                                            attributes: [.posixPermissions: 0o700])
-                    try FileManager.default.copyItem(at: url, to: target)
-                }.value
-                project.stagedFiles[filename] = target
+                try FileManager.default.createDirectory(at: cache, withIntermediateDirectories: true,
+                                                        attributes: [.posixPermissions: 0o700])
+                var new: [TimelineClip] = []
+                var start = time
+                for url in urls {
+                    let filename = "import-\(UUID()).mp4"
+                    let target = cache.appendingPathComponent(filename)
+                    files[filename] = target
+                    try await TakeProject.copyMovie(url, to: target)
+                    let title = url.deletingPathExtension().lastPathComponent
+                    let clips = try await TakeProject.importClips(from: target, title: title, at: start)
+                    new += clips
+                    start = clips.map(\.end).max() ?? start
+                }
+                project.stagedFiles.merge(files) { _, new in new }
                 var next = manifest
                 if new.contains(where: { $0.kind == .originalAudio }), !next.tracks.contains(.originalAudio) {
                     next.tracks.append(.originalAudio)
@@ -412,10 +529,50 @@ final class TakeEditorModel: ObservableObject {
                 next.clips = next.timelineClips + new
                 commitTimeline(next, selecting: new.first?.id)
                 seek(to: time)
+                notice = "已在时间线末尾追加 \(urls.count) 段视频。"
                 loadWaveforms()
             } catch {
-                try? FileManager.default.removeItem(at: target)
+                for target in files.values { try? FileManager.default.removeItem(at: target) }
                 notice = "追加素材失败。\(error.localizedDescription)"
+            }
+        }
+    }
+
+    func importBRoll() {
+        guard !isBusy, canMakeAgentBundle else { return }
+        let panel = NSOpenPanel()
+        panel.title = "添加 B-roll 视频"
+        panel.allowedContentTypes = [.mpeg4Movie, .quickTimeMovie]
+        let start = playhead
+        activity = "选择 B-roll 视频"
+        presentAgentPicker(panel) { response in
+            guard response == .OK, let url = panel.url else { self.activity = nil; return }
+            self.activity = "正在读入 B-roll"
+            Task {
+                defer { self.activity = nil }
+                do {
+                    let ext = url.pathExtension.lowercased() == "mov" ? "mov" : "mp4"
+                    let target = self.cache.appendingPathComponent("b-roll-\(UUID()).\(ext)")
+                    try FileManager.default.createDirectory(at: self.cache, withIntermediateDirectories: true,
+                                                            attributes: [.posixPermissions: 0o700])
+                    do {
+                        try await TakeProject.copyMovie(url, to: target)
+                        let name = url.deletingPathExtension().lastPathComponent
+                        let clips = try await TakeProject.importClips(from: target, title: name, at: start, as: .bRoll)
+                        guard let clip = clips.first else { throw RecorderError.message("找不到可用的 B-roll 画面。") }
+                        var next = self.manifest
+                        if !next.tracks.contains(.bRoll) { next.tracks.append(.bRoll) }
+                        next.clips = ClipEdit.insertingBRoll(clip, in: next.timelineClips)
+                        self.project.stagedFiles[clip.file] = target
+                        self.commitTimeline(next, selecting: clip.id)
+                        self.seek(to: start)
+                    } catch {
+                        try? FileManager.default.removeItem(at: target)
+                        throw error
+                    }
+                } catch {
+                    self.notice = "无法添加 B-roll。\(error.localizedDescription)"
+                }
             }
         }
     }
@@ -542,8 +699,17 @@ final class TakeEditorModel: ObservableObject {
         }
     }
 
+    var canPickFocus: Bool {
+        guard previewReady, manifest.edit(.screen).enabled,
+              manifest.timelineClips.contains(where: { $0.kind == .screen && $0.contains(playhead) }) else { return false }
+        return !manifest.timelineClips.contains {
+            ($0.kind == .bRoll || ($0.kind.isCamera && (canvas.cameraStage == true || $0.fullFrame == true)))
+                && $0.hidden != true && $0.contains(playhead) && manifest.edit($0.kind).enabled
+        }
+    }
+
     func addFocus(at location: CGPoint) {
-        guard let preview, let span = preview.instruction.screen(at: playhead) else { return }
+        guard canPickFocus, let preview, let span = preview.instruction.screen(at: playhead) else { return }
         let motion = span.motion?.frame(at: playhead) ?? MotionEffects.Frame()
         let canvas = CGRect(origin: .zero, size: previewSize)
         let screen = preview.instruction.presentation.screenBounds(in: canvas, sourceAspect: sourceAspect)
@@ -708,6 +874,7 @@ final class TakeEditorModel: ObservableObject {
 
 extension TakeEditorModel {
     func selectSubtitle(_ cue: SubtitleCue, seek: Bool = true) {
+        if selectedTitleID != nil { selectedTitleID = nil }
         if selectedSubtitleID != cue.id { selectedSubtitleID = cue.id }
         if selectedClipID != nil { selectedClipID = nil }
         if seek { self.seek(to: cue.start) }
@@ -718,6 +885,27 @@ extension TakeEditorModel {
         guard let index = cues.firstIndex(where: { $0.id == cue.id }), cues[index] != cue else { return }
         cues[index] = cue
         setSubtitles(cues, record: record)
+    }
+
+    func applySubtitleCorrections(_ corrections: [SubtitleCorrection]) -> Int {
+        let byID = Dictionary(corrections.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        var changedCount = 0
+        let cues = manifest.subtitleCues.map { cue in
+            guard let correction = byID[cue.id], correction.cue.text == cue.text,
+                  correction.replacement != cue.text else { return cue }
+            var updated = cue
+            updated.text = correction.replacement
+            changedCount += 1
+            return updated
+        }
+        if changedCount > 0 {
+            pause()
+            setSubtitles(cues)
+            let skipped = corrections.count - changedCount
+            subtitleNotice = "已校对 \(changedCount) 条字幕，可撤销。"
+                + (skipped > 0 ? "已跳过 \(skipped) 条发生变化的字幕。" : "")
+        }
+        return changedCount
     }
 
     func deleteSubtitle() {
@@ -738,6 +926,40 @@ extension TakeEditorModel {
     private func setSubtitles(_ cues: [SubtitleCue], record: Bool = true) {
         if record { recordUndo(.captions(manifest.subtitles)) }
         manifest.subtitles = cues.sorted { ($0.start, $0.end) < ($1.start, $1.end) }
+    }
+
+    func selectTitle(_ cue: SubtitleCue, seek: Bool = true) {
+        selectedTitleID = cue.id
+        selectedSubtitleID = nil
+        selectedClipID = nil
+        if seek { self.seek(to: cue.start) }
+    }
+
+    func addTitle() {
+        let duration = manifest.timelineDuration
+        guard duration >= SubtitleCue.minimumDuration else { return }
+        let start = min(playhead, max(0, duration - 0.5))
+        let title = SubtitleCue(start: start, end: min(duration, start + 3), text: "重点来了")
+        setTitles(manifest.titleCues + [title])
+        selectTitle(title)
+    }
+
+    func updateTitle(_ title: SubtitleCue, record: Bool = true) {
+        var titles = manifest.titleCues
+        guard let index = titles.firstIndex(where: { $0.id == title.id }), titles[index] != title else { return }
+        titles[index] = title
+        setTitles(titles, record: record)
+    }
+
+    func deleteTitle() {
+        guard let id = selectedTitleID else { return }
+        setTitles(manifest.titleCues.filter { $0.id != id })
+        selectedTitleID = nil
+    }
+
+    private func setTitles(_ titles: [SubtitleCue], record: Bool = true) {
+        if record { recordUndo(.titles(manifest.titles)) }
+        manifest.titles = titles.isEmpty ? nil : titles.sorted { ($0.start, $0.end) < ($1.start, $1.end) }
     }
 
     func importSubtitles() {

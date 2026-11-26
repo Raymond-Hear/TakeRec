@@ -69,6 +69,7 @@ struct PreviewTransport: View {
     @ObservedObject var editor: TakeEditorModel
     let playbackKey: String
     let togglePlayback: () -> Void
+    var firstTakeStep: FirstTakeStep? = nil
 
     var body: some View {
         HStack(spacing: 10) {
@@ -77,9 +78,11 @@ struct PreviewTransport: View {
             }
             .help("\(editor.playing ? "暂停" : "播放") \(playbackKey)")
             .accessibilityLabel(editor.playing ? "暂停" : "播放")
-            .disabled(!editor.previewReady)
+            .disabled(!editor.previewReady || (firstTakeStep == .export && !editor.playing))
+            .firstTakeTarget(.play)
             Slider(value: Binding(get: { editor.playhead }, set: { editor.seek(to: $0) }), in: 0...editor.duration)
                 .accessibilityLabel("时间线播放头")
+                .disabled(firstTakeStep == .review || firstTakeStep == .export)
             Text("\(timelineTime(editor.playhead)) / \(timelineTime(editor.duration))")
                 .font(.caption.monospacedDigit())
         }

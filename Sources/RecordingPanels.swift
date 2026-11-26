@@ -163,7 +163,9 @@ final class RecordingPanels {
     }
 
     private func controlsPanel(for model: RecorderModel, displayID: CGDirectDisplayID?, recenter: Bool) -> NSPanel {
-        let height: CGFloat = model.retainKeystrokes && model.showKeystrokes ? 132 : 102
+        let keyPreviewHeight: CGFloat = model.showsLiveKeys ? 30 : 0
+        let tutorialHeight: CGFloat = model.firstTakeStep == .prepare || model.firstTakeStep == .recording ? 72 : 0
+        let height = 102 + keyPreviewHeight + tutorialHeight
         let saved = lastControlsPosition.flatMap { $0.displayID == displayID && !recenter ? $0.origin : nil }
         let bounds = frame(width: 570, height: height, atTop: false, displayID: displayID, origin: saved)
         let strip = controls ?? panel(title: "录制控制条", bounds: bounds, content: RecordingStrip(model: model))
@@ -258,14 +260,17 @@ struct RecordingStrip: View {
                 mainControls.frame(height: 58)
                 Rectangle().fill(.white.opacity(0.12)).frame(height: 1)
                 shortcutGuide.frame(height: 20)
-                if model.retainKeystrokes && model.showKeystrokes { keyPreview.frame(height: 23) }
+                if model.showsLiveKeys { keyPreview.frame(height: 23) }
             }
             .padding(.horizontal, 13)
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .padding(.top, model.firstTakeStep == .recording ? 7 : 0)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: model.firstTakeStep == .recording ? .top : .center)
         }
         .background(Color(red: 0.11, green: 0.11, blue: 0.14), in: RoundedRectangle(cornerRadius: 15))
         .overlay { RoundedRectangle(cornerRadius: 15).strokeBorder(.white.opacity(0.13)).allowsHitTesting(false) }
         .environment(\.colorScheme, .dark)
+        .firstTakeSpotlight(model.firstTakeStep == .recording ? .stop : nil)
+        .clipShape(RoundedRectangle(cornerRadius: 15))
     }
 
     private var shortcutGuide: some View {
@@ -347,9 +352,11 @@ struct RecordingStrip: View {
                 }
                 .buttonStyle(.bordered)
                 .fixedSize()
+                .disabled(model.firstTakeInProgress)
                 Button { model.stop() } label: { Label("结束", systemImage: "stop.fill") }
                     .buttonStyle(DeskPrimaryButton(color: Color(red: 0.74, green: 0.18, blue: 0.20)))
                     .fixedSize()
+                    .firstTakeTarget(.stop)
             }
     }
 }

@@ -12,6 +12,7 @@ struct TimelineClip: Codable, Equatable, Identifiable, Sendable {
     var length: Double
     var at: Double
     var hidden: Bool?
+    var fullFrame: Bool?
 
     var end: Double { at + length }
     var sourceEnd: Double { sourceStart + length }
@@ -29,6 +30,23 @@ struct TimelineClip: Codable, Equatable, Identifiable, Sendable {
 
 enum ClipEdit {
     private static let epsilon = 0.00001
+
+    static func insertingBRoll(_ addition: TimelineClip, in clips: [TimelineClip]) -> [TimelineClip] {
+        let updated = clips.flatMap { clip -> [TimelineClip] in
+            guard clip.kind == .bRoll, clip.at < addition.end, clip.end > addition.at else { return [clip] }
+            var remaining: [TimelineClip] = []
+            if addition.at - clip.at >= TimelineClip.minimumLength - epsilon {
+                remaining.append(clip.section(from: clip.at, to: addition.at))
+            }
+            if clip.end - addition.end >= TimelineClip.minimumLength - epsilon {
+                var right = clip.section(from: addition.end, to: clip.end)
+                if !remaining.isEmpty { right.id = UUID() }
+                remaining.append(right)
+            }
+            return remaining
+        }
+        return updated + [addition]
+    }
 
     static func split(_ clips: [TimelineClip], at time: Double, kind: TrackKind?) -> ([TimelineClip], UUID?) {
         var selected: UUID?
@@ -102,6 +120,27 @@ enum ClipEdit {
         return clips.filter { $0.kind != kind } + packed
     }
 
+    static func gaps(in clips: [TimelineClip], kind: TrackKind, duration: Double) -> [Range<Double>] {
+        let track = clips.filter { $0.kind == kind }.sorted { $0.at < $1.at }
+        guard !track.isEmpty else { return [] }
+        var gaps: [Range<Double>] = []
+        var end = 0.0
+        for clip in track {
+            if clip.at - end > epsilon { gaps.append(end..<clip.at) }
+            end = max(end, clip.end)
+        }
+        if duration - end > epsilon { gaps.append(end..<duration) }
+        return gaps
+    }
+
+    static func adjoiningGap(for interval: Range<Double>, on kind: TrackKind, in clips: [TimelineClip]) -> Range<Double> {
+        guard kind == .screen else { return interval }
+        let track = clips.filter { $0.kind == kind }
+        guard let next = track.filter({ $0.at >= interval.upperBound - epsilon }).map(\.at).min() else { return interval }
+        let previous = track.filter { $0.end <= interval.lowerBound + epsilon }.map(\.end).max() ?? 0
+        return min(previous, interval.lowerBound)..<max(next, interval.upperBound)
+    }
+
     static func removeTime(from start: Double, to end: Double, in clips: [TimelineClip]) -> [TimelineClip] {
         guard end > start else { return clips }
         return clips.flatMap { clip -> [TimelineClip] in
@@ -112,10 +151,10 @@ enum ClipEdit {
                 return [moved]
             }
             var remaining: [TimelineClip] = []
-            if start - clip.at >= TimelineClip.minimumLength {
+            if start - clip.at >= TimelineClip.minimumLength - epsilon {
                 remaining.append(clip.section(from: clip.at, to: start))
             }
-            if clip.end - end >= TimelineClip.minimumLength {
+            if clip.end - end >= TimelineClip.minimumLength - epsilon {
                 var right = clip.section(from: end, to: clip.end)
                 right.at = start
                 if !remaining.isEmpty { right.id = UUID() }

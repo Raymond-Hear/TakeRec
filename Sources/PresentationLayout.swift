@@ -98,6 +98,7 @@ struct PortraitCanvas: Codable, Equatable, Sendable {
 struct PresentationSettings: Codable, Equatable, Sendable {
     var framing = OutputFraming.source
     var portrait = PortraitCanvas()
+    var cameraStage: Bool?
 
     func screenBounds(in canvas: CGRect, sourceAspect: CGFloat) -> CGRect {
         switch framing {
@@ -113,6 +114,20 @@ struct PresentationSettings: Codable, Equatable, Sendable {
     func cameraBoxes(in canvas: CGRect, count: Int, settings: EffectSettings) -> [CGRect] {
         guard count > 0 else { return [] }
         let edge = min(canvas.width, canvas.height)
+        if cameraStage == true {
+            guard count > 1 else { return [canvas] }
+            let sideBySide = canvas.width >= canvas.height
+            let total = sideBySide ? canvas.width : canvas.height
+            let gap = min(max(2, (edge * 0.004).rounded()), total / (2 * CGFloat(count - 1)))
+            let cell = (total - gap * CGFloat(count - 1)) / CGFloat(count)
+            return (0..<count).map { index in
+                let offset = (cell + gap) * CGFloat(index)
+                if sideBySide {
+                    return CGRect(x: canvas.minX + offset, y: canvas.minY, width: cell, height: canvas.height)
+                }
+                return CGRect(x: canvas.minX, y: canvas.maxY - offset - cell, width: canvas.width, height: cell)
+            }
+        }
         let margin = edge * 0.032
         let gap = edge * 0.015
         let side = edge * clamp(settings.cameraSize, 0.12, 0.55)
